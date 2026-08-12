@@ -1,0 +1,17 @@
+{
+  "name": "truth-button-reviews-api",
+  "version": "1.0.0",
+  "description": "Backend API for The Truth Button's Reviews section (work, sports, restaurants, price watch, economy)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
