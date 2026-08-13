@@ -133,6 +133,7 @@ function requireAdmin(req, res, next){
 
 // ---------- app ----------
 const app = express();
+app.set('trust proxy', 1); // Render sits behind a reverse proxy — without this, req.ip is the proxy's IP for every request, making rate limiting apply to all visitors combined instead of per-visitor
 
 // Stripe webhook needs the raw request body to verify the signature, so this
 // route is registered before the global express.json() body parser below.
@@ -398,6 +399,10 @@ app.post('/api/admin/users/:id/role', requireAdmin, (req, res) => {
   const data = readUsers();
   const user = data.users.find(u => u.id === req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found.' });
+  const remainingAdmins = data.users.filter(u => u.role === 'admin' && u.id !== user.id).length;
+  if (role === 'member' && user.role === 'admin' && remainingAdmins === 0) {
+    return res.status(400).json({ error: 'Cannot demote the last remaining admin.' });
+  }
   user.role = role;
   writeUsers(data)
     .then(() => res.json({ user: publicUser(user) }))
