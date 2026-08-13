@@ -10,12 +10,16 @@
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'reviews.json');
+const LICENSES_FILE = path.join(DATA_DIR, 'licenses.json');
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 
 const ALLOWED_CATEGORIES = ['work', 'sports', 'restaurants', 'prices', 'economy'];
 const MAX_TEXT_LEN = 2000;
@@ -26,27 +30,38 @@ const MAX_REPLY_LEN = 500;
 // ---------- storage: JSON file with a simple write queue to avoid concurrent-write corruption ----------
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({ reviews: [] }, null, 2));
+if (!fs.existsSync(LICENSES_FILE)) fs.writeFileSync(LICENSES_FILE, JSON.stringify({ licenses: [] }, null, 2));
 
 let writeQueue = Promise.resolve();
 
-function readData(){
+function readJsonFile(file, fallback){
   try {
-    const raw = fs.readFileSync(DATA_FILE, 'utf8');
+    const raw = fs.readFileSync(file, 'utf8');
     return JSON.parse(raw);
   } catch (e) {
-    return { reviews: [] };
+    return fallback;
   }
 }
 
-function writeData(data){
+function writeJsonFile(file, data){
   writeQueue = writeQueue.then(() => {
     return new Promise((resolve, reject) => {
-      fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2), err => {
+      fs.writeFile(file, JSON.stringify(data, null, 2), err => {
         if (err) reject(err); else resolve();
       });
     });
   });
   return writeQueue;
+}
+
+function readData(){ return readJsonFile(DATA_FILE, { reviews: [] }); }
+function writeData(data){ return writeJsonFile(DATA_FILE, data); }
+function readLicenses(){ return readJsonFile(LICENSES_FILE, { licenses: [] }); }
+function writeLicenses(data){ return writeJsonFile(LICENSES_FILE, data); }
+
+function makeLicenseKey(){
+  const part = () => crypto.randomBytes(2).toString('hex').toUpperCase();
+  return `TB-${part()}-${part()}-${part()}`;
 }
 
 // ---------- helpers ----------
@@ -63,6 +78,35 @@ function isValidCategory(c){ return ALLOWED_CATEGORIES.includes(c); }
 
 // ---------- app ----------
 const app = express();
+
+// Stripe webhook needs the raw request body to verify the signature, so this
+// route is registered before the global express.json() body parser below.
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.status(503).send('Stripe not configured.');
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send('Webhook signature verification failed.');
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const license = {
+      key: makeLicenseKey(),
+      sessionId: session.id,
+      email: (session.customer_details && session.customer_details.email) || session.customer_email || '',
+      createdAt: Date.now(),
+      active: true
+    };
+    const data = readLicenses();
+    data.licenses.push(license);
+    writeLicenses(data).catch(() => {});
+  }
+
+  res.json({ received: true });
+});
+
 app.use(express.json({ limit: '100kb' }));
 
 const allowedOrigin = process.env.ALLOWED_ORIGIN;
@@ -171,6 +215,28 @@ app.post('/api/reviews/:id/reply', rateLimit(20), (req, res) => {
   writeData(data)
     .then(() => res.json({ review }))
     .catch(() => res.status(500).json({ error: 'Could not save reply.' }));
+});
+
+// GET /api/license/for-session?session_id=cs_xxx
+// Used by the post-checkout success page to display the key. The webhook usually
+// beats the redirect, but if the key isn't there yet this returns 202 so the
+// page can retry briefly instead of treating it as a hard failure.
+app.get('/api/license/for-session', rateLimit(30), (req, res) => {
+  const sessionId = req.query.session_id;
+  if (!sessionId) return res.status(400).json({ error: 'session_id is required.' });
+  const data = readLicenses();
+  const license = data.licenses.find(l => l.sessionId === sessionId);
+  if (!license) return res.status(202).json({ pending: true });
+  res.json({ key: license.key });
+});
+
+// POST /api/license/verify — body: { key }
+app.post('/api/license/verify', rateLimit(20), (req, res) => {
+  const key = clip((req.body || {}).key, 40).toUpperCase();
+  if (!key) return res.status(400).json({ error: 'License key is required.' });
+  const data = readLicenses();
+  const license = data.licenses.find(l => l.key === key);
+  res.json({ valid: !!(license && license.active) });
 });
 
 app.listen(PORT, () => {
