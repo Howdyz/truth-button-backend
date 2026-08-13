@@ -414,6 +414,25 @@ app.delete('/api/admin/reviews/:id', requireAdmin, (req, res) => {
     .catch(() => res.status(500).json({ error: 'Could not delete review.' }));
 });
 
+// POST /api/admin/license/backfill — manually create a license for a completed Checkout
+// Session that the webhook never received (e.g. the destination didn't exist yet, or
+// was misconfigured at the time of purchase). body: { sessionId, email }
+app.post('/api/admin/license/backfill', requireAdmin, (req, res) => {
+  const sessionId = clip((req.body || {}).sessionId, 200);
+  const email = clip((req.body || {}).email, 200);
+  if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' });
+
+  const data = readLicenses();
+  const existing = data.licenses.find(l => l.sessionId === sessionId);
+  if (existing) return res.json({ key: existing.key, alreadyExisted: true });
+
+  const license = { key: makeLicenseKey(), sessionId, email, createdAt: Date.now(), active: true };
+  data.licenses.push(license);
+  writeLicenses(data)
+    .then(() => res.status(201).json({ key: license.key }))
+    .catch(() => res.status(500).json({ error: 'Could not create license.' }));
+});
+
 // GET /api/license/for-session?session_id=cs_xxx
 // Used by the post-checkout success page to display the key. The webhook usually
 // beats the redirect, but if the key isn't there yet this returns 202 so the
