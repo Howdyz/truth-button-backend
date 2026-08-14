@@ -23,7 +23,6 @@ const QOTD_FILE = path.join(DATA_DIR, 'qotd.json');
 const ALLOWED_CATEGORIES = ['work', 'sports', 'restaurants', 'prices', 'economy'];
 const MAX_TEXT_LEN = 2000;
 const MAX_SUBJECT_LEN = 140;
-const MAX_NAME_LEN = 60;
 const MAX_REPLY_LEN = 500;
 const MAX_QUESTION_LEN = 300;
 
