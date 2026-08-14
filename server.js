@@ -4,9 +4,11 @@
 //
 // Run locally:   npm install && npm start
 // Env vars:
-//   PORT              — port to listen on (default 3000)
-//   ALLOWED_ORIGIN     — set to your site's origin to lock down CORS in production
-//                        (comma-separated for multiple). Defaults to "*" (open) for easy setup.
+//   PORT                — port to listen on (default 3000)
+//   ALLOWED_ORIGIN       — set to your site's origin to lock down CORS in production
+//                          (comma-separated for multiple). Defaults to "*" (open) for easy setup.
+//   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET — needed for the Mobile Share license flow
+//   MAINTENANCE_SECRET   — any random string; required to call /api/license/backfill
 
 const express = require('express');
 const cors = require('cors');
@@ -22,6 +24,7 @@ const LICENSES_FILE = path.join(DATA_DIR, 'licenses.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const QOTD_FILE = path.join(DATA_DIR, 'qotd.json');
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const MAINTENANCE_SECRET = process.env.MAINTENANCE_SECRET || '';
 
 const ALLOWED_CATEGORIES = ['work', 'sports', 'restaurants', 'prices', 'economy'];
 const MAX_TEXT_LEN = 2000;
@@ -108,7 +111,7 @@ function verifyPassword(password, stored){
 function isValidEmail(email){ return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email); }
 
 function publicUser(user){
-  return { id: user.id, username: user.username, role: user.role, contributionScore: user.contributionScore || 0 };
+  return { id: user.id, username: user.username, contributionScore: user.contributionScore || 0 };
 }
 
 function requireAuth(req, res, next){
@@ -124,11 +127,14 @@ function requireAuth(req, res, next){
   next();
 }
 
-function requireAdmin(req, res, next){
-  requireAuth(req, res, () => {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
-    next();
-  });
+// Guards maintenance-only endpoints (like the license backfill tool) with a shared
+// secret instead of a user account, since there's no admin role anymore.
+function requireMaintenanceSecret(req, res, next){
+  const provided = req.headers['x-maintenance-secret'] || '';
+  if (!MAINTENANCE_SECRET || provided !== MAINTENANCE_SECRET) {
+    return res.status(401).json({ error: 'Not authorized.' });
+  }
+  next();
 }
 
 // ---------- app ----------
@@ -196,8 +202,7 @@ app.get('/api/health', (req, res) => {
 
 // ---------- auth ----------
 
-// POST /api/auth/signup — the very first account ever created becomes admin automatically,
-// so the site owner just has to sign up first on a fresh deploy.
+// POST /api/auth/signup — free, plain accounts, no roles.
 app.post('/api/auth/signup', rateLimit(10), (req, res) => {
   const body = req.body || {};
   const username = clip(body.username, 30);
@@ -216,7 +221,6 @@ app.post('/api/auth/signup', rateLimit(10), (req, res) => {
     id: makeId(),
     username, email,
     passwordHash: hashPassword(password),
-    role: data.users.length === 0 ? 'admin' : 'member',
     contributionScore: 0,
     createdAt: Date.now()
   };
@@ -269,7 +273,7 @@ app.get('/api/leaderboard', (req, res) => {
   res.json({ leaderboard });
 });
 
-// POST /api/qotd — only the current top contributor or an admin can set it
+// POST /api/qotd — only the current top contributor can set it
 app.post('/api/qotd', requireAuth, rateLimit(10), (req, res) => {
   const question = clip((req.body || {}).question, MAX_QUESTION_LEN);
   if (!question) return res.status(400).json({ error: 'Question is required.' });
@@ -279,8 +283,7 @@ app.post('/api/qotd', requireAuth, rateLimit(10), (req, res) => {
     .map(u => ({ id: u.id, contributionScore: u.contributionScore || 0 }))
     .sort((a, b) => b.contributionScore - a.contributionScore);
   const isTop = leaderboard.length > 0 && leaderboard[0].id === req.user.id && leaderboard[0].contributionScore > 0;
-  const isAdmin = req.user.role === 'admin';
-  if (!isTop && !isAdmin) return res.status(403).json({ error: 'Only the top contributor or an admin can set the question of the day.' });
+  if (!isTop) return res.status(403).json({ error: 'Only the top contributor can set the question of the day.' });
 
   const qotd = { question, setBy: req.user.username, setAt: Date.now() };
   writeQotd({ qotd })
@@ -375,54 +378,11 @@ app.post('/api/reviews/:id/reply', requireAuth, rateLimit(20), (req, res) => {
     .catch(() => res.status(500).json({ error: 'Could not save reply.' }));
 });
 
-// ---------- admin ----------
-
-app.get('/api/admin/stats', requireAdmin, (req, res) => {
-  const users = readUsers().users;
-  const reviews = readData().reviews;
-  res.json({
-    totalUsers: users.length,
-    totalAdmins: users.filter(u => u.role === 'admin').length,
-    totalReviews: reviews.length,
-    totalReplies: reviews.reduce((sum, r) => sum + (r.replies ? r.replies.length : 0), 0)
-  });
-});
-
-app.get('/api/admin/users', requireAdmin, (req, res) => {
-  const users = readUsers().users.slice().sort((a, b) => (b.contributionScore || 0) - (a.contributionScore || 0));
-  res.json({ users: users.map(publicUser) });
-});
-
-app.post('/api/admin/users/:id/role', requireAdmin, (req, res) => {
-  const role = (req.body || {}).role;
-  if (role !== 'admin' && role !== 'member') return res.status(400).json({ error: 'Role must be "admin" or "member".' });
-  const data = readUsers();
-  const user = data.users.find(u => u.id === req.params.id);
-  if (!user) return res.status(404).json({ error: 'User not found.' });
-  const remainingAdmins = data.users.filter(u => u.role === 'admin' && u.id !== user.id).length;
-  if (role === 'member' && user.role === 'admin' && remainingAdmins === 0) {
-    return res.status(400).json({ error: 'Cannot demote the last remaining admin.' });
-  }
-  user.role = role;
-  writeUsers(data)
-    .then(() => res.json({ user: publicUser(user) }))
-    .catch(() => res.status(500).json({ error: 'Could not update role.' }));
-});
-
-app.delete('/api/admin/reviews/:id', requireAdmin, (req, res) => {
-  const data = readData();
-  const before = data.reviews.length;
-  data.reviews = data.reviews.filter(r => r.id !== req.params.id);
-  if (data.reviews.length === before) return res.status(404).json({ error: 'Review not found.' });
-  writeData(data)
-    .then(() => res.json({ ok: true }))
-    .catch(() => res.status(500).json({ error: 'Could not delete review.' }));
-});
-
-// POST /api/admin/license/backfill — manually create a license for a completed Checkout
+// POST /api/license/backfill — manually create a license for a completed Checkout
 // Session that the webhook never received (e.g. the destination didn't exist yet, or
 // was misconfigured at the time of purchase). body: { sessionId, email }
-app.post('/api/admin/license/backfill', requireAdmin, (req, res) => {
+// Guarded by MAINTENANCE_SECRET (set as an env var) instead of an admin account.
+app.post('/api/license/backfill', requireMaintenanceSecret, (req, res) => {
   const sessionId = clip((req.body || {}).sessionId, 200);
   const email = clip((req.body || {}).email, 200);
   if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' });
