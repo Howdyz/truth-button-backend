@@ -38,12 +38,6 @@ Server listens on `http://localhost:3000` by default (override with `PORT`).
 - `GET /api/leaderboard` — top contributors by score
 - `POST /api/qotd` — requires auth, and only works if you're the current top contributor — body: `{ question }`
 
-**Mobile Share licenses** (Stripe-purchased add-on)
-- `POST /api/stripe-webhook` — Stripe calls this directly; not for manual use
-- `GET /api/license/for-session?session_id=cs_xxx` — used by `unlock.html` to show the key after checkout
-- `POST /api/license/verify` — body: `{ key }` → `{ valid }`
-- `POST /api/license/backfill` — maintenance tool for a purchase the webhook missed. Requires header `X-Maintenance-Secret: <MAINTENANCE_SECRET>` — body: `{ sessionId, email }`
-
 ## Deploying it for real (so it's reachable from your live site)
 
 You need somewhere that keeps a Node process running continuously — this
@@ -85,8 +79,6 @@ other sites can't hit your API from a browser.
 
 - `PORT` — port to listen on (default 3000)
 - `ALLOWED_ORIGIN` — locks down CORS (see above), comma-separated for multiple origins
-- `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` — needed for the Mobile Share license flow
-- `MAINTENANCE_SECRET` — any random string you pick. Required to call `/api/license/backfill`. Set it once in Render's Environment tab, then pass it as the `X-Maintenance-Secret` header when you need to run that tool.
 
 ## Connecting the frontend
 

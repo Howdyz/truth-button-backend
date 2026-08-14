@@ -7,24 +7,18 @@
 //   PORT                — port to listen on (default 3000)
 //   ALLOWED_ORIGIN       — set to your site's origin to lock down CORS in production
 //                          (comma-separated for multiple). Defaults to "*" (open) for easy setup.
-//   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET — needed for the Mobile Share license flow
-//   MAINTENANCE_SECRET   — any random string; required to call /api/license/backfill
 
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'reviews.json');
-const LICENSES_FILE = path.join(DATA_DIR, 'licenses.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const QOTD_FILE = path.join(DATA_DIR, 'qotd.json');
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
-const MAINTENANCE_SECRET = process.env.MAINTENANCE_SECRET || '';
 
 const ALLOWED_CATEGORIES = ['work', 'sports', 'restaurants', 'prices', 'economy'];
 const MAX_TEXT_LEN = 2000;
@@ -36,7 +30,6 @@ const MAX_QUESTION_LEN = 300;
 // ---------- storage: JSON file with a simple write queue to avoid concurrent-write corruption ----------
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({ reviews: [] }, null, 2));
-if (!fs.existsSync(LICENSES_FILE)) fs.writeFileSync(LICENSES_FILE, JSON.stringify({ licenses: [] }, null, 2));
 if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, JSON.stringify({ users: [] }, null, 2));
 if (!fs.existsSync(QOTD_FILE)) fs.writeFileSync(QOTD_FILE, JSON.stringify({ qotd: null }, null, 2));
 
@@ -64,17 +57,10 @@ function writeJsonFile(file, data){
 
 function readData(){ return readJsonFile(DATA_FILE, { reviews: [] }); }
 function writeData(data){ return writeJsonFile(DATA_FILE, data); }
-function readLicenses(){ return readJsonFile(LICENSES_FILE, { licenses: [] }); }
-function writeLicenses(data){ return writeJsonFile(LICENSES_FILE, data); }
 function readUsers(){ return readJsonFile(USERS_FILE, { users: [] }); }
 function writeUsers(data){ return writeJsonFile(USERS_FILE, data); }
 function readQotd(){ return readJsonFile(QOTD_FILE, { qotd: null }); }
 function writeQotd(data){ return writeJsonFile(QOTD_FILE, data); }
-
-function makeLicenseKey(){
-  const part = () => crypto.randomBytes(2).toString('hex').toUpperCase();
-  return `TB-${part()}-${part()}-${part()}`;
-}
 
 // ---------- helpers ----------
 function makeId(){
@@ -127,47 +113,9 @@ function requireAuth(req, res, next){
   next();
 }
 
-// Guards maintenance-only endpoints (like the license backfill tool) with a shared
-// secret instead of a user account, since there's no admin role anymore.
-function requireMaintenanceSecret(req, res, next){
-  const provided = req.headers['x-maintenance-secret'] || '';
-  if (!MAINTENANCE_SECRET || provided !== MAINTENANCE_SECRET) {
-    return res.status(401).json({ error: 'Not authorized.' });
-  }
-  next();
-}
-
 // ---------- app ----------
 const app = express();
 app.set('trust proxy', 1); // Render sits behind a reverse proxy — without this, req.ip is the proxy's IP for every request, making rate limiting apply to all visitors combined instead of per-visitor
-
-// Stripe webhook needs the raw request body to verify the signature, so this
-// route is registered before the global express.json() body parser below.
-app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), (req, res) => {
-  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.status(503).send('Stripe not configured.');
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    return res.status(400).send('Webhook signature verification failed.');
-  }
-
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const license = {
-      key: makeLicenseKey(),
-      sessionId: session.id,
-      email: (session.customer_details && session.customer_details.email) || session.customer_email || '',
-      createdAt: Date.now(),
-      active: true
-    };
-    const data = readLicenses();
-    data.licenses.push(license);
-    writeLicenses(data).catch(() => {});
-  }
-
-  res.json({ received: true });
-});
 
 app.use(express.json({ limit: '100kb' }));
 
@@ -376,48 +324,6 @@ app.post('/api/reviews/:id/reply', requireAuth, rateLimit(20), (req, res) => {
   Promise.all([writeData(data), writeUsers(usersData)])
     .then(() => res.json({ review }))
     .catch(() => res.status(500).json({ error: 'Could not save reply.' }));
-});
-
-// POST /api/license/backfill — manually create a license for a completed Checkout
-// Session that the webhook never received (e.g. the destination didn't exist yet, or
-// was misconfigured at the time of purchase). body: { sessionId, email }
-// Guarded by MAINTENANCE_SECRET (set as an env var) instead of an admin account.
-app.post('/api/license/backfill', requireMaintenanceSecret, (req, res) => {
-  const sessionId = clip((req.body || {}).sessionId, 200);
-  const email = clip((req.body || {}).email, 200);
-  if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' });
-
-  const data = readLicenses();
-  const existing = data.licenses.find(l => l.sessionId === sessionId);
-  if (existing) return res.json({ key: existing.key, alreadyExisted: true });
-
-  const license = { key: makeLicenseKey(), sessionId, email, createdAt: Date.now(), active: true };
-  data.licenses.push(license);
-  writeLicenses(data)
-    .then(() => res.status(201).json({ key: license.key }))
-    .catch(() => res.status(500).json({ error: 'Could not create license.' }));
-});
-
-// GET /api/license/for-session?session_id=cs_xxx
-// Used by the post-checkout success page to display the key. The webhook usually
-// beats the redirect, but if the key isn't there yet this returns 202 so the
-// page can retry briefly instead of treating it as a hard failure.
-app.get('/api/license/for-session', rateLimit(30), (req, res) => {
-  const sessionId = req.query.session_id;
-  if (!sessionId) return res.status(400).json({ error: 'session_id is required.' });
-  const data = readLicenses();
-  const license = data.licenses.find(l => l.sessionId === sessionId);
-  if (!license) return res.status(202).json({ pending: true });
-  res.json({ key: license.key });
-});
-
-// POST /api/license/verify — body: { key }
-app.post('/api/license/verify', rateLimit(20), (req, res) => {
-  const key = clip((req.body || {}).key, 40).toUpperCase();
-  if (!key) return res.status(400).json({ error: 'License key is required.' });
-  const data = readLicenses();
-  const license = data.licenses.find(l => l.key === key);
-  res.json({ valid: !!(license && license.active) });
 });
 
 app.listen(PORT, () => {
