@@ -23,6 +23,7 @@ const DATA_FILE = path.join(DATA_DIR, 'reviews.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const QOTD_FILE = path.join(DATA_DIR, 'qotd.json');
 const VISITS_FILE = path.join(DATA_DIR, 'visits.json');
+const ADS_FILE = path.join(DATA_DIR, 'ads.json');
 
 const ALLOWED_CATEGORIES = ['work', 'sports', 'restaurants', 'prices', 'economy'];
 const MAX_TEXT_LEN = 2000;
@@ -31,6 +32,10 @@ const MAX_REPLY_LEN = 500;
 const MAX_QUESTION_LEN = 300;
 const MAX_PATH_LEN = 200;
 const VISIT_DAYS_KEPT = 90; // trim daily counters older than this so the file doesn't grow forever
+const MAX_ADVERTISER_LEN = 60;
+const MAX_HEADLINE_LEN = 100;
+const MAX_AD_BODY_LEN = 200;
+const MAX_URL_LEN = 500;
 
 // ---------- storage: JSON file with a simple write queue to avoid concurrent-write corruption ----------
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -38,6 +43,7 @@ if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({ revi
 if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, JSON.stringify({ users: [] }, null, 2));
 if (!fs.existsSync(QOTD_FILE)) fs.writeFileSync(QOTD_FILE, JSON.stringify({ qotd: null }, null, 2));
 if (!fs.existsSync(VISITS_FILE)) fs.writeFileSync(VISITS_FILE, JSON.stringify({ totalViews: 0, byDay: {}, byPath: {}, byReferrer: {}, firstSeen: null, lastSeen: null }, null, 2));
+if (!fs.existsSync(ADS_FILE)) fs.writeFileSync(ADS_FILE, JSON.stringify({ ads: [] }, null, 2));
 
 let writeQueue = Promise.resolve();
 
@@ -69,6 +75,8 @@ function readQotd(){ return readJsonFile(QOTD_FILE, { qotd: null }); }
 function writeQotd(data){ return writeJsonFile(QOTD_FILE, data); }
 function readVisits(){ return readJsonFile(VISITS_FILE, { totalViews: 0, byDay: {}, byPath: {}, byReferrer: {}, firstSeen: null, lastSeen: null }); }
 function writeVisits(data){ return writeJsonFile(VISITS_FILE, data); }
+function readAds(){ return readJsonFile(ADS_FILE, { ads: [] }); }
+function writeAds(data){ return writeJsonFile(ADS_FILE, data); }
 
 // ---------- helpers ----------
 function makeId(){
@@ -144,6 +152,19 @@ function referrerHost(referrer){
 
 function dayKey(timestamp){
   return new Date(timestamp).toISOString().slice(0, 10); // YYYY-MM-DD, UTC
+}
+
+function isValidHttpUrl(str){
+  try {
+    const u = new URL(str);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch (e) {
+    return false;
+  }
+}
+
+function publicAd(ad){
+  return { id: ad.id, advertiser: ad.advertiser, headline: ad.headline, body: ad.body, imageUrl: ad.imageUrl || null };
 }
 
 // ---------- app ----------
@@ -231,6 +252,111 @@ app.get('/api/stats', requireAdmin, (req, res) => {
     topPaths: topN(visits.byPath, 15),
     topReferrers: topN(visits.byReferrer, 15)
   });
+});
+
+// ---------- ads ----------
+
+// GET /api/ads/active — public. Returns active ads (no impression/click counts —
+// those are only exposed to the admin) so the frontend can pick one to display.
+app.get('/api/ads/active', (req, res) => {
+  const data = readAds();
+  const active = data.ads.filter(a => a.active).map(publicAd);
+  res.json({ ads: active });
+});
+
+// GET /api/ads/:id/click — records the click, then redirects to the advertiser's URL.
+// A plain link (not a JS fetch) so it works reliably in new tabs / with JS disabled.
+app.get('/api/ads/:id/click', perMinute(120), (req, res) => {
+  const data = readAds();
+  const ad = data.ads.find(a => a.id === req.params.id);
+  if (!ad || !ad.active) return res.status(404).json({ error: 'Ad not found.' });
+  ad.clicks = (ad.clicks || 0) + 1;
+  writeAds(data).catch(() => {});
+  res.redirect(302, ad.linkUrl);
+});
+
+// POST /api/ads/:id/impression — fired once when an ad is actually shown.
+app.post('/api/ads/:id/impression', perMinute(120), (req, res) => {
+  const data = readAds();
+  const ad = data.ads.find(a => a.id === req.params.id);
+  if (!ad) return res.status(404).json({ error: 'Ad not found.' });
+  ad.impressions = (ad.impressions || 0) + 1;
+  writeAds(data)
+    .then(() => res.json({ ok: true }))
+    .catch(() => res.status(500).json({ error: 'Could not record impression.' }));
+});
+
+// GET /api/ads — admin: full list including stats, active or not.
+app.get('/api/ads', requireAdmin, (req, res) => {
+  const data = readAds();
+  res.json({ ads: data.ads });
+});
+
+// POST /api/ads — admin: create a new ad.
+app.post('/api/ads', requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const advertiser = clip(body.advertiser, MAX_ADVERTISER_LEN);
+  const headline = clip(body.headline, MAX_HEADLINE_LEN);
+  const adBody = clip(body.body, MAX_AD_BODY_LEN);
+  const linkUrl = clip(body.linkUrl, MAX_URL_LEN);
+  const imageUrl = clip(body.imageUrl, MAX_URL_LEN);
+
+  if (!advertiser) return res.status(400).json({ error: 'Advertiser name is required.' });
+  if (!headline) return res.status(400).json({ error: 'Headline is required.' });
+  if (!isValidHttpUrl(linkUrl)) return res.status(400).json({ error: 'A valid http(s) link URL is required.' });
+  if (imageUrl && !isValidHttpUrl(imageUrl)) return res.status(400).json({ error: 'Image URL must be a valid http(s) link.' });
+
+  const ad = {
+    id: makeId(),
+    advertiser, headline, body: adBody, linkUrl,
+    imageUrl: imageUrl || null,
+    active: body.active !== false,
+    impressions: 0,
+    clicks: 0,
+    createdAt: Date.now()
+  };
+  const data = readAds();
+  data.ads.unshift(ad);
+  writeAds(data)
+    .then(() => res.status(201).json({ ad }))
+    .catch(() => res.status(500).json({ error: 'Could not save ad.' }));
+});
+
+// PATCH /api/ads/:id — admin: edit fields or toggle active.
+app.patch('/api/ads/:id', requireAdmin, (req, res) => {
+  const data = readAds();
+  const ad = data.ads.find(a => a.id === req.params.id);
+  if (!ad) return res.status(404).json({ error: 'Ad not found.' });
+
+  const body = req.body || {};
+  if (body.advertiser !== undefined) ad.advertiser = clip(body.advertiser, MAX_ADVERTISER_LEN);
+  if (body.headline !== undefined) ad.headline = clip(body.headline, MAX_HEADLINE_LEN);
+  if (body.body !== undefined) ad.body = clip(body.body, MAX_AD_BODY_LEN);
+  if (body.linkUrl !== undefined) {
+    if (!isValidHttpUrl(body.linkUrl)) return res.status(400).json({ error: 'A valid http(s) link URL is required.' });
+    ad.linkUrl = clip(body.linkUrl, MAX_URL_LEN);
+  }
+  if (body.imageUrl !== undefined) {
+    const img = clip(body.imageUrl, MAX_URL_LEN);
+    if (img && !isValidHttpUrl(img)) return res.status(400).json({ error: 'Image URL must be a valid http(s) link.' });
+    ad.imageUrl = img || null;
+  }
+  if (body.active !== undefined) ad.active = !!body.active;
+
+  writeAds(data)
+    .then(() => res.json({ ad }))
+    .catch(() => res.status(500).json({ error: 'Could not update ad.' }));
+});
+
+// DELETE /api/ads/:id — admin: remove an ad entirely.
+app.delete('/api/ads/:id', requireAdmin, (req, res) => {
+  const data = readAds();
+  const before = data.ads.length;
+  data.ads = data.ads.filter(a => a.id !== req.params.id);
+  if (data.ads.length === before) return res.status(404).json({ error: 'Ad not found.' });
+  writeAds(data)
+    .then(() => res.json({ ok: true }))
+    .catch(() => res.status(500).json({ error: 'Could not delete ad.' }));
 });
 
 // ---------- auth ----------
