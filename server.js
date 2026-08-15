@@ -11,6 +11,8 @@
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -123,7 +125,10 @@ function requireAuth(req, res, next){
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 function requireAdmin(req, res, next){
   if (!ADMIN_SECRET) return res.status(503).json({ error: 'Admin dashboard not configured on this server.' });
-  if (req.headers['x-admin-secret'] !== ADMIN_SECRET) return res.status(401).json({ error: 'Unauthorized.' });
+  const provided = Buffer.from(String(req.headers['x-admin-secret'] || ''));
+  const expected = Buffer.from(ADMIN_SECRET);
+  const match = provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
+  if (!match) return res.status(401).json({ error: 'Unauthorized.' });
   next();
 }
 
@@ -144,6 +149,9 @@ function dayKey(timestamp){
 // ---------- app ----------
 const app = express();
 app.set('trust proxy', 1); // Render sits behind a reverse proxy — without this, req.ip is the proxy's IP for every request, making rate limiting apply to all visitors combined instead of per-visitor
+app.disable('x-powered-by');
+
+app.use(helmet());
 
 app.use(express.json({ limit: '100kb' }));
 
@@ -155,21 +163,19 @@ if (allowedOrigin) {
   app.use(cors()); // open for easy first-time setup; lock down with ALLOWED_ORIGIN in production
 }
 
-// very light rate limiting per IP (in-memory, resets on restart — fine for a small community feature)
-const rateBuckets = new Map();
-function rateLimit(maxPerMinute){
-  return (req, res, next) => {
-    const ip = req.ip || 'unknown';
-    const now = Date.now();
-    const bucket = rateBuckets.get(ip) || [];
-    const recent = bucket.filter(t => now - t < 60000);
-    if (recent.length >= maxPerMinute) {
-      return res.status(429).json({ error: 'Too many requests. Slow down a bit.' });
-    }
-    recent.push(now);
-    rateBuckets.set(ip, recent);
-    next();
-  };
+// global floor: blunts broad floods before they even reach route-specific limits below
+app.use(perMinute(300));
+
+// per-route rate limiting (express-rate-limit: bounded memory, auto-expiring buckets —
+// unlike a hand-rolled version, old IPs don't linger forever and leak memory)
+function perMinute(max){
+  return rateLimit({
+    windowMs: 60000,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests. Slow down a bit.' }
+  });
 }
 
 app.get('/api/health', (req, res) => {
@@ -180,7 +186,7 @@ app.get('/api/health', (req, res) => {
 
 // POST /api/track — fired once per page load from the frontend. Stores aggregated
 // counters only (no per-visit log, no IPs) to keep the file small and visitors anonymous.
-app.post('/api/track', rateLimit(30), (req, res) => {
+app.post('/api/track', perMinute(30), (req, res) => {
   const body = req.body || {};
   const visitPath = clip(body.path, MAX_PATH_LEN) || '/';
   const host = referrerHost(body.referrer);
@@ -227,7 +233,7 @@ app.get('/api/stats', requireAdmin, (req, res) => {
 // ---------- auth ----------
 
 // POST /api/auth/signup — free, plain accounts, no roles.
-app.post('/api/auth/signup', rateLimit(10), (req, res) => {
+app.post('/api/auth/signup', perMinute(10), (req, res) => {
   const body = req.body || {};
   const username = clip(body.username, 30);
   const email = clip(body.email, 200).toLowerCase();
@@ -259,7 +265,7 @@ app.post('/api/auth/signup', rateLimit(10), (req, res) => {
 });
 
 // POST /api/auth/login
-app.post('/api/auth/login', rateLimit(20), (req, res) => {
+app.post('/api/auth/login', perMinute(20), (req, res) => {
   const body = req.body || {};
   const email = clip(body.email, 200).toLowerCase();
   const password = String(body.password || '');
@@ -298,7 +304,7 @@ app.get('/api/leaderboard', (req, res) => {
 });
 
 // POST /api/qotd — only the current top contributor can set it
-app.post('/api/qotd', requireAuth, rateLimit(10), (req, res) => {
+app.post('/api/qotd', requireAuth, perMinute(10), (req, res) => {
   const question = clip((req.body || {}).question, MAX_QUESTION_LEN);
   if (!question) return res.status(400).json({ error: 'Question is required.' });
 
@@ -330,7 +336,7 @@ app.get('/api/reviews', (req, res) => {
 });
 
 // POST /api/reviews
-app.post('/api/reviews', requireAuth, rateLimit(12), (req, res) => {
+app.post('/api/reviews', requireAuth, perMinute(12), (req, res) => {
   const body = req.body || {};
   const category = body.category;
   const state = clip(body.state, 40);
@@ -371,7 +377,7 @@ app.post('/api/reviews', requireAuth, rateLimit(12), (req, res) => {
 });
 
 // POST /api/reviews/:id/like
-app.post('/api/reviews/:id/like', rateLimit(60), (req, res) => {
+app.post('/api/reviews/:id/like', perMinute(60), (req, res) => {
   const data = readData();
   const review = data.reviews.find(r => r.id === req.params.id);
   if (!review) return res.status(404).json({ error: 'Review not found.' });
@@ -382,7 +388,7 @@ app.post('/api/reviews/:id/like', rateLimit(60), (req, res) => {
 });
 
 // POST /api/reviews/:id/reply
-app.post('/api/reviews/:id/reply', requireAuth, rateLimit(20), (req, res) => {
+app.post('/api/reviews/:id/reply', requireAuth, perMinute(20), (req, res) => {
   const data = readData();
   const review = data.reviews.find(r => r.id === req.params.id);
   if (!review) return res.status(404).json({ error: 'Review not found.' });
@@ -400,6 +406,22 @@ app.post('/api/reviews/:id/reply', requireAuth, rateLimit(20), (req, res) => {
   Promise.all([writeData(data), writeUsers(usersData)])
     .then(() => res.json({ review }))
     .catch(() => res.status(500).json({ error: 'Could not save reply.' }));
+});
+
+// ---------- fallbacks: never leak a stack trace or Express's default HTML error page ----------
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found.' });
+});
+
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request too large.' });
+  }
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Malformed request body.' });
+  }
+  console.error(err);
+  res.status(500).json({ error: 'Something went wrong.' });
 });
 
 app.listen(PORT, () => {
