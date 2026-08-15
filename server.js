@@ -7,6 +7,7 @@
 //   PORT                — port to listen on (default 3000)
 //   ALLOWED_ORIGIN       — set to your site's origin to lock down CORS in production
 //                          (comma-separated for multiple). Defaults to "*" (open) for easy setup.
+//   ADMIN_SECRET         — required to view /api/stats (the visitor dashboard). Unset = dashboard disabled.
 
 const express = require('express');
 const cors = require('cors');
@@ -19,18 +20,22 @@ const DATA_DIR = path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'reviews.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const QOTD_FILE = path.join(DATA_DIR, 'qotd.json');
+const VISITS_FILE = path.join(DATA_DIR, 'visits.json');
 
 const ALLOWED_CATEGORIES = ['work', 'sports', 'restaurants', 'prices', 'economy'];
 const MAX_TEXT_LEN = 2000;
 const MAX_SUBJECT_LEN = 140;
 const MAX_REPLY_LEN = 500;
 const MAX_QUESTION_LEN = 300;
+const MAX_PATH_LEN = 200;
+const VISIT_DAYS_KEPT = 90; // trim daily counters older than this so the file doesn't grow forever
 
 // ---------- storage: JSON file with a simple write queue to avoid concurrent-write corruption ----------
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({ reviews: [] }, null, 2));
 if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, JSON.stringify({ users: [] }, null, 2));
 if (!fs.existsSync(QOTD_FILE)) fs.writeFileSync(QOTD_FILE, JSON.stringify({ qotd: null }, null, 2));
+if (!fs.existsSync(VISITS_FILE)) fs.writeFileSync(VISITS_FILE, JSON.stringify({ totalViews: 0, byDay: {}, byPath: {}, byReferrer: {}, firstSeen: null, lastSeen: null }, null, 2));
 
 let writeQueue = Promise.resolve();
 
@@ -60,6 +65,8 @@ function readUsers(){ return readJsonFile(USERS_FILE, { users: [] }); }
 function writeUsers(data){ return writeJsonFile(USERS_FILE, data); }
 function readQotd(){ return readJsonFile(QOTD_FILE, { qotd: null }); }
 function writeQotd(data){ return writeJsonFile(QOTD_FILE, data); }
+function readVisits(){ return readJsonFile(VISITS_FILE, { totalViews: 0, byDay: {}, byPath: {}, byReferrer: {}, firstSeen: null, lastSeen: null }); }
+function writeVisits(data){ return writeJsonFile(VISITS_FILE, data); }
 
 // ---------- helpers ----------
 function makeId(){
@@ -112,6 +119,28 @@ function requireAuth(req, res, next){
   next();
 }
 
+// ---------- admin: shared-secret gate for the visitor dashboard (not a user account) ----------
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
+function requireAdmin(req, res, next){
+  if (!ADMIN_SECRET) return res.status(503).json({ error: 'Admin dashboard not configured on this server.' });
+  if (req.headers['x-admin-secret'] !== ADMIN_SECRET) return res.status(401).json({ error: 'Unauthorized.' });
+  next();
+}
+
+function referrerHost(referrer){
+  if (!referrer) return 'direct';
+  try {
+    const host = new URL(referrer).hostname.replace(/^www\./, '');
+    return host || 'direct';
+  } catch (e) {
+    return 'direct';
+  }
+}
+
+function dayKey(timestamp){
+  return new Date(timestamp).toISOString().slice(0, 10); // YYYY-MM-DD, UTC
+}
+
 // ---------- app ----------
 const app = express();
 app.set('trust proxy', 1); // Render sits behind a reverse proxy — without this, req.ip is the proxy's IP for every request, making rate limiting apply to all visitors combined instead of per-visitor
@@ -145,6 +174,54 @@ function rateLimit(maxPerMinute){
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, time: Date.now() });
+});
+
+// ---------- visitor tracking ----------
+
+// POST /api/track — fired once per page load from the frontend. Stores aggregated
+// counters only (no per-visit log, no IPs) to keep the file small and visitors anonymous.
+app.post('/api/track', rateLimit(30), (req, res) => {
+  const body = req.body || {};
+  const visitPath = clip(body.path, MAX_PATH_LEN) || '/';
+  const host = referrerHost(body.referrer);
+  const now = Date.now();
+  const today = dayKey(now);
+
+  const visits = readVisits();
+  visits.totalViews = (visits.totalViews || 0) + 1;
+  visits.byDay[today] = (visits.byDay[today] || 0) + 1;
+  visits.byPath[visitPath] = (visits.byPath[visitPath] || 0) + 1;
+  visits.byReferrer[host] = (visits.byReferrer[host] || 0) + 1;
+  visits.firstSeen = visits.firstSeen || now;
+  visits.lastSeen = now;
+
+  const cutoff = new Date(now - VISIT_DAYS_KEPT * 86400000).toISOString().slice(0, 10);
+  for (const day of Object.keys(visits.byDay)) {
+    if (day < cutoff) delete visits.byDay[day];
+  }
+
+  writeVisits(visits)
+    .then(() => res.status(201).json({ ok: true }))
+    .catch(() => res.status(500).json({ error: 'Could not record visit.' }));
+});
+
+// GET /api/stats — the private dashboard's data source. Requires the ADMIN_SECRET
+// header, not a user login (this isn't tied to the reviews accounts system).
+app.get('/api/stats', requireAdmin, (req, res) => {
+  const visits = readVisits();
+  const topN = (obj, n) => Object.entries(obj)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([key, count]) => ({ key, count }));
+
+  res.json({
+    totalViews: visits.totalViews || 0,
+    firstSeen: visits.firstSeen,
+    lastSeen: visits.lastSeen,
+    byDay: visits.byDay,
+    topPaths: topN(visits.byPath, 15),
+    topReferrers: topN(visits.byReferrer, 15)
+  });
 });
 
 // ---------- auth ----------
