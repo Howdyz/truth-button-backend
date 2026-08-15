@@ -184,9 +184,12 @@ app.get('/api/health', (req, res) => {
 
 // ---------- visitor tracking ----------
 
-// POST /api/track — fired once per page load from the frontend. Stores aggregated
+// POST /api/visit — fired once per page load from the frontend. Stores aggregated
 // counters only (no per-visit log, no IPs) to keep the file small and visitors anonymous.
-app.post('/api/track', perMinute(30), (req, res) => {
+// Named deliberately generic (not "/track") since ad-blockers and privacy extensions
+// (uBlock's EasyPrivacy, Brave Shields, Firefox ETP) filter requests by URL patterns
+// containing "track" — a plain analytics-sounding path avoids that silently eating hits.
+app.post('/api/visit', perMinute(30), (req, res) => {
   const body = req.body || {};
   const visitPath = clip(body.path, MAX_PATH_LEN) || '/';
   const host = referrerHost(body.referrer);
