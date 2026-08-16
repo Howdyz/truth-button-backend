@@ -16,6 +16,7 @@ const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const scannerRoutes = require('./scanner/publicRoutes');
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, 'data');
@@ -536,6 +537,9 @@ app.post('/api/reviews/:id/reply', requireAuth, perMinute(20), (req, res) => {
     .then(() => res.json({ review }))
     .catch(() => res.status(500).json({ error: 'Could not save reply.' }));
 });
+
+// ---------- code scanner (public, report-only) ----------
+app.use(scannerRoutes);
 
 // ---------- fallbacks: never leak a stack trace or Express's default HTML error page ----------
 app.use((req, res) => {
