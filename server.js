@@ -1,30 +1,28 @@
 // Truth Button — Reviews API
-// A small, self-contained Express backend. Data persists to a local JSON file
-// (data/reviews.json). No external database required to get started.
+// A small, self-contained Express backend. Data persists to Upstash Redis
+// (REST API, no extra client library needed — just fetch). Render's free
+// tier has no persistent disk, so local JSON files get wiped on every
+// restart; Redis is what actually survives across deploys/restarts.
 //
 // Run locally:   npm install && npm start
 // Env vars:
-//   PORT                — port to listen on (default 3000)
-//   ALLOWED_ORIGIN       — set to your site's origin to lock down CORS in production
-//                          (comma-separated for multiple). Defaults to "*" (open) for easy setup.
-//   ADMIN_SECRET         — required to view /api/stats (the visitor dashboard). Unset = dashboard disabled.
+//   PORT                     — port to listen on (default 3000)
+//   ALLOWED_ORIGIN            — set to your site's origin to lock down CORS in production
+//                               (comma-separated for multiple). Defaults to "*" (open) for easy setup.
+//   ADMIN_SECRET              — required to view /api/stats (the visitor dashboard). Unset = dashboard disabled.
+//   UPSTASH_REDIS_REST_URL    — Upstash Redis REST endpoint (e.g. https://xxx.upstash.io).
+//   UPSTASH_REDIS_REST_TOKEN  — Upstash Redis REST token.
+//   Without the two Upstash vars set, storage falls back to an in-memory store
+//   (fine for local dev/testing — NOT persistent, resets on every restart).
 
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 const scannerRoutes = require('./scanner/publicRoutes');
 
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = path.join(__dirname, 'data');
-const DATA_FILE = path.join(DATA_DIR, 'reviews.json');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const QOTD_FILE = path.join(DATA_DIR, 'qotd.json');
-const VISITS_FILE = path.join(DATA_DIR, 'visits.json');
-const ADS_FILE = path.join(DATA_DIR, 'ads.json');
 
 const ALLOWED_CATEGORIES = ['work', 'sports', 'restaurants', 'prices', 'economy'];
 const MAX_TEXT_LEN = 2000;
@@ -32,52 +30,58 @@ const MAX_SUBJECT_LEN = 140;
 const MAX_REPLY_LEN = 500;
 const MAX_QUESTION_LEN = 300;
 const MAX_PATH_LEN = 200;
-const VISIT_DAYS_KEPT = 90; // trim daily counters older than this so the file doesn't grow forever
+const VISIT_DAYS_KEPT = 90; // trim daily counters older than this so the record doesn't grow forever
 const MAX_ADVERTISER_LEN = 60;
 const MAX_HEADLINE_LEN = 100;
 const MAX_AD_BODY_LEN = 200;
 const MAX_URL_LEN = 500;
 
-// ---------- storage: JSON file with a simple write queue to avoid concurrent-write corruption ----------
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({ reviews: [] }, null, 2));
-if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, JSON.stringify({ users: [] }, null, 2));
-if (!fs.existsSync(QOTD_FILE)) fs.writeFileSync(QOTD_FILE, JSON.stringify({ qotd: null }, null, 2));
-if (!fs.existsSync(VISITS_FILE)) fs.writeFileSync(VISITS_FILE, JSON.stringify({ totalViews: 0, byDay: {}, byPath: {}, byReferrer: {}, firstSeen: null, lastSeen: null }, null, 2));
-if (!fs.existsSync(ADS_FILE)) fs.writeFileSync(ADS_FILE, JSON.stringify({ ads: [] }, null, 2));
+// ---------- storage: Upstash Redis REST API, with an in-memory fallback for local dev ----------
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const memoryStore = new Map();
 
-let writeQueue = Promise.resolve();
+if (!REDIS_URL || !REDIS_TOKEN) {
+  console.warn('UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN not set — using in-memory storage. ' +
+    'Data will NOT persist across restarts. Set both env vars in production.');
+}
 
-function readJsonFile(file, fallback){
-  try {
-    const raw = fs.readFileSync(file, 'utf8');
-    return JSON.parse(raw);
-  } catch (e) {
-    return fallback;
+async function storeGet(key, fallback){
+  if (!REDIS_URL || !REDIS_TOKEN) {
+    return memoryStore.has(key) ? memoryStore.get(key) : fallback;
   }
-}
-
-function writeJsonFile(file, data){
-  writeQueue = writeQueue.then(() => {
-    return new Promise((resolve, reject) => {
-      fs.writeFile(file, JSON.stringify(data, null, 2), err => {
-        if (err) reject(err); else resolve();
-      });
-    });
+  const res = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
   });
-  return writeQueue;
+  if (!res.ok) throw new Error('Redis GET failed: ' + res.status);
+  const data = await res.json();
+  if (data.result == null) return fallback;
+  try { return JSON.parse(data.result); } catch (e) { return fallback; }
 }
 
-function readData(){ return readJsonFile(DATA_FILE, { reviews: [] }); }
-function writeData(data){ return writeJsonFile(DATA_FILE, data); }
-function readUsers(){ return readJsonFile(USERS_FILE, { users: [] }); }
-function writeUsers(data){ return writeJsonFile(USERS_FILE, data); }
-function readQotd(){ return readJsonFile(QOTD_FILE, { qotd: null }); }
-function writeQotd(data){ return writeJsonFile(QOTD_FILE, data); }
-function readVisits(){ return readJsonFile(VISITS_FILE, { totalViews: 0, byDay: {}, byPath: {}, byReferrer: {}, firstSeen: null, lastSeen: null }); }
-function writeVisits(data){ return writeJsonFile(VISITS_FILE, data); }
-function readAds(){ return readJsonFile(ADS_FILE, { ads: [] }); }
-function writeAds(data){ return writeJsonFile(ADS_FILE, data); }
+async function storeSet(key, value){
+  if (!REDIS_URL || !REDIS_TOKEN) {
+    memoryStore.set(key, value);
+    return;
+  }
+  const res = await fetch(`${REDIS_URL}/set/${encodeURIComponent(key)}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'text/plain' },
+    body: JSON.stringify(value)
+  });
+  if (!res.ok) throw new Error('Redis SET failed: ' + res.status);
+}
+
+function readData(){ return storeGet('tb:reviews', { reviews: [] }); }
+function writeData(data){ return storeSet('tb:reviews', data); }
+function readUsers(){ return storeGet('tb:users', { users: [] }); }
+function writeUsers(data){ return storeSet('tb:users', data); }
+function readQotd(){ return storeGet('tb:qotd', { qotd: null }); }
+function writeQotd(data){ return storeSet('tb:qotd', data); }
+function readVisits(){ return storeGet('tb:visits', { totalViews: 0, byDay: {}, byPath: {}, byReferrer: {}, firstSeen: null, lastSeen: null }); }
+function writeVisits(data){ return storeSet('tb:visits', data); }
+function readAds(){ return storeGet('tb:ads', { ads: [] }); }
+function writeAds(data){ return storeSet('tb:ads', data); }
 
 // ---------- helpers ----------
 function makeId(){
@@ -93,7 +97,8 @@ function isValidCategory(c){ return ALLOWED_CATEGORIES.includes(c); }
 
 // ---------- auth: password hashing (scrypt, no extra dependency) + bearer-token sessions ----------
 // Sessions live in memory only — they reset if the server restarts (e.g. Render's
-// free tier spinning down), same tradeoff as everything else on the free JSON-file setup.
+// free tier spinning down). Reviews/users/ads/visits now survive that via Redis;
+// being logged out on restart is a much smaller tradeoff than losing data outright.
 const sessions = new Map(); // token -> userId
 
 function hashPassword(password){
@@ -117,12 +122,12 @@ function publicUser(user){
   return { id: user.id, username: user.username, contributionScore: user.contributionScore || 0 };
 }
 
-function requireAuth(req, res, next){
+async function requireAuth(req, res, next){
   const authHeader = req.headers['authorization'] || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
   const userId = token && sessions.get(token);
   if (!userId) return res.status(401).json({ error: 'Sign in required.' });
-  const data = readUsers();
+  const data = await readUsers();
   const user = data.users.find(u => u.id === userId);
   if (!user) return res.status(401).json({ error: 'Sign in required.' });
   req.user = user;
@@ -185,9 +190,6 @@ if (allowedOrigin) {
   app.use(cors()); // open for easy first-time setup; lock down with ALLOWED_ORIGIN in production
 }
 
-// global floor: blunts broad floods before they even reach route-specific limits below
-app.use(perMinute(300));
-
 // per-route rate limiting (express-rate-limit: bounded memory, auto-expiring buckets —
 // unlike a hand-rolled version, old IPs don't linger forever and leak memory)
 function perMinute(max){
@@ -200,6 +202,9 @@ function perMinute(max){
   });
 }
 
+// global floor: blunts broad floods before they even reach route-specific limits below
+app.use(perMinute(300));
+
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, time: Date.now() });
 });
@@ -207,39 +212,42 @@ app.get('/api/health', (req, res) => {
 // ---------- visitor tracking ----------
 
 // POST /api/visit — fired once per page load from the frontend. Stores aggregated
-// counters only (no per-visit log, no IPs) to keep the file small and visitors anonymous.
+// counters only (no per-visit log, no IPs) to keep the record small and visitors anonymous.
 // Named deliberately generic (not "/track") since ad-blockers and privacy extensions
 // (uBlock's EasyPrivacy, Brave Shields, Firefox ETP) filter requests by URL patterns
 // containing "track" — a plain analytics-sounding path avoids that silently eating hits.
-app.post('/api/visit', perMinute(30), (req, res) => {
+app.post('/api/visit', perMinute(30), async (req, res) => {
   const body = req.body || {};
   const visitPath = clip(body.path, MAX_PATH_LEN) || '/';
   const host = referrerHost(body.referrer);
   const now = Date.now();
   const today = dayKey(now);
 
-  const visits = readVisits();
-  visits.totalViews = (visits.totalViews || 0) + 1;
-  visits.byDay[today] = (visits.byDay[today] || 0) + 1;
-  visits.byPath[visitPath] = (visits.byPath[visitPath] || 0) + 1;
-  visits.byReferrer[host] = (visits.byReferrer[host] || 0) + 1;
-  visits.firstSeen = visits.firstSeen || now;
-  visits.lastSeen = now;
+  try {
+    const visits = await readVisits();
+    visits.totalViews = (visits.totalViews || 0) + 1;
+    visits.byDay[today] = (visits.byDay[today] || 0) + 1;
+    visits.byPath[visitPath] = (visits.byPath[visitPath] || 0) + 1;
+    visits.byReferrer[host] = (visits.byReferrer[host] || 0) + 1;
+    visits.firstSeen = visits.firstSeen || now;
+    visits.lastSeen = now;
 
-  const cutoff = new Date(now - VISIT_DAYS_KEPT * 86400000).toISOString().slice(0, 10);
-  for (const day of Object.keys(visits.byDay)) {
-    if (day < cutoff) delete visits.byDay[day];
+    const cutoff = new Date(now - VISIT_DAYS_KEPT * 86400000).toISOString().slice(0, 10);
+    for (const day of Object.keys(visits.byDay)) {
+      if (day < cutoff) delete visits.byDay[day];
+    }
+
+    await writeVisits(visits);
+    res.status(201).json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not record visit.' });
   }
-
-  writeVisits(visits)
-    .then(() => res.status(201).json({ ok: true }))
-    .catch(() => res.status(500).json({ error: 'Could not record visit.' }));
 });
 
 // GET /api/stats — the private dashboard's data source. Requires the ADMIN_SECRET
 // header, not a user login (this isn't tied to the reviews accounts system).
-app.get('/api/stats', requireAdmin, (req, res) => {
-  const visits = readVisits();
+app.get('/api/stats', requireAdmin, async (req, res) => {
+  const visits = await readVisits();
   const topN = (obj, n) => Object.entries(obj)
     .sort((a, b) => b[1] - a[1])
     .slice(0, n)
@@ -259,16 +267,16 @@ app.get('/api/stats', requireAdmin, (req, res) => {
 
 // GET /api/ads/active — public. Returns active ads (no impression/click counts —
 // those are only exposed to the admin) so the frontend can pick one to display.
-app.get('/api/ads/active', (req, res) => {
-  const data = readAds();
+app.get('/api/ads/active', async (req, res) => {
+  const data = await readAds();
   const active = data.ads.filter(a => a.active).map(publicAd);
   res.json({ ads: active });
 });
 
 // GET /api/ads/:id/click — records the click, then redirects to the advertiser's URL.
 // A plain link (not a JS fetch) so it works reliably in new tabs / with JS disabled.
-app.get('/api/ads/:id/click', perMinute(120), (req, res) => {
-  const data = readAds();
+app.get('/api/ads/:id/click', perMinute(120), async (req, res) => {
+  const data = await readAds();
   const ad = data.ads.find(a => a.id === req.params.id);
   if (!ad || !ad.active) return res.status(404).json({ error: 'Ad not found.' });
   ad.clicks = (ad.clicks || 0) + 1;
@@ -277,8 +285,8 @@ app.get('/api/ads/:id/click', perMinute(120), (req, res) => {
 });
 
 // POST /api/ads/:id/impression — fired once when an ad is actually shown.
-app.post('/api/ads/:id/impression', perMinute(120), (req, res) => {
-  const data = readAds();
+app.post('/api/ads/:id/impression', perMinute(120), async (req, res) => {
+  const data = await readAds();
   const ad = data.ads.find(a => a.id === req.params.id);
   if (!ad) return res.status(404).json({ error: 'Ad not found.' });
   ad.impressions = (ad.impressions || 0) + 1;
@@ -288,13 +296,13 @@ app.post('/api/ads/:id/impression', perMinute(120), (req, res) => {
 });
 
 // GET /api/ads — admin: full list including stats, active or not.
-app.get('/api/ads', requireAdmin, (req, res) => {
-  const data = readAds();
+app.get('/api/ads', requireAdmin, async (req, res) => {
+  const data = await readAds();
   res.json({ ads: data.ads });
 });
 
 // POST /api/ads — admin: create a new ad.
-app.post('/api/ads', requireAdmin, (req, res) => {
+app.post('/api/ads', requireAdmin, async (req, res) => {
   const body = req.body || {};
   const advertiser = clip(body.advertiser, MAX_ADVERTISER_LEN);
   const headline = clip(body.headline, MAX_HEADLINE_LEN);
@@ -316,7 +324,7 @@ app.post('/api/ads', requireAdmin, (req, res) => {
     clicks: 0,
     createdAt: Date.now()
   };
-  const data = readAds();
+  const data = await readAds();
   data.ads.unshift(ad);
   writeAds(data)
     .then(() => res.status(201).json({ ad }))
@@ -324,8 +332,8 @@ app.post('/api/ads', requireAdmin, (req, res) => {
 });
 
 // PATCH /api/ads/:id — admin: edit fields or toggle active.
-app.patch('/api/ads/:id', requireAdmin, (req, res) => {
-  const data = readAds();
+app.patch('/api/ads/:id', requireAdmin, async (req, res) => {
+  const data = await readAds();
   const ad = data.ads.find(a => a.id === req.params.id);
   if (!ad) return res.status(404).json({ error: 'Ad not found.' });
 
@@ -350,8 +358,8 @@ app.patch('/api/ads/:id', requireAdmin, (req, res) => {
 });
 
 // DELETE /api/ads/:id — admin: remove an ad entirely.
-app.delete('/api/ads/:id', requireAdmin, (req, res) => {
-  const data = readAds();
+app.delete('/api/ads/:id', requireAdmin, async (req, res) => {
+  const data = await readAds();
   const before = data.ads.length;
   data.ads = data.ads.filter(a => a.id !== req.params.id);
   if (data.ads.length === before) return res.status(404).json({ error: 'Ad not found.' });
@@ -363,7 +371,7 @@ app.delete('/api/ads/:id', requireAdmin, (req, res) => {
 // ---------- auth ----------
 
 // POST /api/auth/signup — free, plain accounts, no roles.
-app.post('/api/auth/signup', perMinute(10), (req, res) => {
+app.post('/api/auth/signup', perMinute(10), async (req, res) => {
   const body = req.body || {};
   const username = clip(body.username, 30);
   const email = clip(body.email, 200).toLowerCase();
@@ -373,7 +381,7 @@ app.post('/api/auth/signup', perMinute(10), (req, res) => {
   if (!isValidEmail(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
 
-  const data = readUsers();
+  const data = await readUsers();
   if (data.users.some(u => u.email === email)) return res.status(400).json({ error: 'An account with that email already exists.' });
   if (data.users.some(u => u.username.toLowerCase() === username.toLowerCase())) return res.status(400).json({ error: 'That username is taken.' });
 
@@ -395,12 +403,12 @@ app.post('/api/auth/signup', perMinute(10), (req, res) => {
 });
 
 // POST /api/auth/login
-app.post('/api/auth/login', perMinute(20), (req, res) => {
+app.post('/api/auth/login', perMinute(20), async (req, res) => {
   const body = req.body || {};
   const email = clip(body.email, 200).toLowerCase();
   const password = String(body.password || '');
 
-  const data = readUsers();
+  const data = await readUsers();
   const user = data.users.find(u => u.email === email);
   if (!user || !verifyPassword(password, user.passwordHash)) {
     return res.status(401).json({ error: 'Incorrect email or password.' });
@@ -420,12 +428,13 @@ app.post('/api/auth/logout', (req, res) => {
 
 // ---------- QOTD + leaderboard ----------
 
-app.get('/api/qotd', (req, res) => {
-  res.json({ qotd: readQotd().qotd });
+app.get('/api/qotd', async (req, res) => {
+  const data = await readQotd();
+  res.json({ qotd: data.qotd });
 });
 
-app.get('/api/leaderboard', (req, res) => {
-  const data = readUsers();
+app.get('/api/leaderboard', async (req, res) => {
+  const data = await readUsers();
   const leaderboard = data.users
     .map(u => ({ username: u.username, contributionScore: u.contributionScore || 0 }))
     .filter(u => u.contributionScore > 0)
@@ -434,11 +443,11 @@ app.get('/api/leaderboard', (req, res) => {
 });
 
 // POST /api/qotd — only the current top contributor can set it
-app.post('/api/qotd', requireAuth, perMinute(10), (req, res) => {
+app.post('/api/qotd', requireAuth, perMinute(10), async (req, res) => {
   const question = clip((req.body || {}).question, MAX_QUESTION_LEN);
   if (!question) return res.status(400).json({ error: 'Question is required.' });
 
-  const usersData = readUsers();
+  const usersData = await readUsers();
   const leaderboard = usersData.users
     .map(u => ({ id: u.id, contributionScore: u.contributionScore || 0 }))
     .sort((a, b) => b.contributionScore - a.contributionScore);
@@ -452,12 +461,12 @@ app.post('/api/qotd', requireAuth, perMinute(10), (req, res) => {
 });
 
 // GET /api/reviews?category=work&state=texas
-app.get('/api/reviews', (req, res) => {
+app.get('/api/reviews', async (req, res) => {
   const { category, state } = req.query;
   if (category && !isValidCategory(category)) {
     return res.status(400).json({ error: 'Unknown category.' });
   }
-  const data = readData();
+  const data = await readData();
   let results = data.reviews;
   if (category) results = results.filter(r => r.category === category);
   if (state) results = results.filter(r => r.state.toLowerCase() === String(state).toLowerCase());
@@ -466,7 +475,7 @@ app.get('/api/reviews', (req, res) => {
 });
 
 // POST /api/reviews
-app.post('/api/reviews', requireAuth, perMinute(12), (req, res) => {
+app.post('/api/reviews', requireAuth, perMinute(12), async (req, res) => {
   const body = req.body || {};
   const category = body.category;
   const state = clip(body.state, 40);
@@ -494,10 +503,10 @@ app.post('/api/reviews', requireAuth, perMinute(12), (req, res) => {
     replies: []
   };
 
-  const data = readData();
+  const data = await readData();
   data.reviews.unshift(review);
 
-  const usersData = readUsers();
+  const usersData = await readUsers();
   const user = usersData.users.find(u => u.id === req.user.id);
   if (user) user.contributionScore = (user.contributionScore || 0) + 3;
 
@@ -507,8 +516,8 @@ app.post('/api/reviews', requireAuth, perMinute(12), (req, res) => {
 });
 
 // POST /api/reviews/:id/like
-app.post('/api/reviews/:id/like', perMinute(60), (req, res) => {
-  const data = readData();
+app.post('/api/reviews/:id/like', perMinute(60), async (req, res) => {
+  const data = await readData();
   const review = data.reviews.find(r => r.id === req.params.id);
   if (!review) return res.status(404).json({ error: 'Review not found.' });
   review.likes = (review.likes || 0) + 1;
@@ -518,8 +527,8 @@ app.post('/api/reviews/:id/like', perMinute(60), (req, res) => {
 });
 
 // POST /api/reviews/:id/reply
-app.post('/api/reviews/:id/reply', requireAuth, perMinute(20), (req, res) => {
-  const data = readData();
+app.post('/api/reviews/:id/reply', requireAuth, perMinute(20), async (req, res) => {
+  const data = await readData();
   const review = data.reviews.find(r => r.id === req.params.id);
   if (!review) return res.status(404).json({ error: 'Review not found.' });
 
@@ -529,7 +538,7 @@ app.post('/api/reviews/:id/reply', requireAuth, perMinute(20), (req, res) => {
   if (!review.replies) review.replies = [];
   review.replies.push({ id: makeId(), name: req.user.username, text, timestamp: Date.now() });
 
-  const usersData = readUsers();
+  const usersData = await readUsers();
   const user = usersData.users.find(u => u.id === req.user.id);
   if (user) user.contributionScore = (user.contributionScore || 0) + 1;
 
