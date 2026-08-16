@@ -22,6 +22,15 @@ const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const scannerRoutes = require('./scanner/publicRoutes');
 
+// Express 4 does NOT catch a rejected promise from an async handler — it becomes an
+// unhandled rejection, which crashes the whole process on modern Node (terminates by
+// default since Node 15). Every async route/middleware below is wrapped in this so a
+// transient Redis hiccup returns a clean 500 to one request instead of killing the
+// server for every visitor.
+function asyncHandler(fn){
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
+
 const PORT = process.env.PORT || 3000;
 
 const ALLOWED_CATEGORIES = ['work', 'sports', 'restaurants', 'prices', 'economy'];
@@ -122,7 +131,7 @@ function publicUser(user){
   return { id: user.id, username: user.username, contributionScore: user.contributionScore || 0 };
 }
 
-async function requireAuth(req, res, next){
+const requireAuth = asyncHandler(async (req, res, next) => {
   const authHeader = req.headers['authorization'] || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
   const userId = token && sessions.get(token);
@@ -133,7 +142,7 @@ async function requireAuth(req, res, next){
   req.user = user;
   req.token = token;
   next();
-}
+});
 
 // ---------- admin: shared-secret gate for the visitor dashboard (not a user account) ----------
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
@@ -216,37 +225,33 @@ app.get('/api/health', (req, res) => {
 // Named deliberately generic (not "/track") since ad-blockers and privacy extensions
 // (uBlock's EasyPrivacy, Brave Shields, Firefox ETP) filter requests by URL patterns
 // containing "track" — a plain analytics-sounding path avoids that silently eating hits.
-app.post('/api/visit', perMinute(30), async (req, res) => {
+app.post('/api/visit', perMinute(30), asyncHandler(async (req, res) => {
   const body = req.body || {};
   const visitPath = clip(body.path, MAX_PATH_LEN) || '/';
   const host = referrerHost(body.referrer);
   const now = Date.now();
   const today = dayKey(now);
 
-  try {
-    const visits = await readVisits();
-    visits.totalViews = (visits.totalViews || 0) + 1;
-    visits.byDay[today] = (visits.byDay[today] || 0) + 1;
-    visits.byPath[visitPath] = (visits.byPath[visitPath] || 0) + 1;
-    visits.byReferrer[host] = (visits.byReferrer[host] || 0) + 1;
-    visits.firstSeen = visits.firstSeen || now;
-    visits.lastSeen = now;
+  const visits = await readVisits();
+  visits.totalViews = (visits.totalViews || 0) + 1;
+  visits.byDay[today] = (visits.byDay[today] || 0) + 1;
+  visits.byPath[visitPath] = (visits.byPath[visitPath] || 0) + 1;
+  visits.byReferrer[host] = (visits.byReferrer[host] || 0) + 1;
+  visits.firstSeen = visits.firstSeen || now;
+  visits.lastSeen = now;
 
-    const cutoff = new Date(now - VISIT_DAYS_KEPT * 86400000).toISOString().slice(0, 10);
-    for (const day of Object.keys(visits.byDay)) {
-      if (day < cutoff) delete visits.byDay[day];
-    }
-
-    await writeVisits(visits);
-    res.status(201).json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: 'Could not record visit.' });
+  const cutoff = new Date(now - VISIT_DAYS_KEPT * 86400000).toISOString().slice(0, 10);
+  for (const day of Object.keys(visits.byDay)) {
+    if (day < cutoff) delete visits.byDay[day];
   }
-});
+
+  await writeVisits(visits);
+  res.status(201).json({ ok: true });
+}));
 
 // GET /api/stats — the private dashboard's data source. Requires the ADMIN_SECRET
 // header, not a user login (this isn't tied to the reviews accounts system).
-app.get('/api/stats', requireAdmin, async (req, res) => {
+app.get('/api/stats', requireAdmin, asyncHandler(async (req, res) => {
   const visits = await readVisits();
   const topN = (obj, n) => Object.entries(obj)
     .sort((a, b) => b[1] - a[1])
@@ -261,31 +266,31 @@ app.get('/api/stats', requireAdmin, async (req, res) => {
     topPaths: topN(visits.byPath, 15),
     topReferrers: topN(visits.byReferrer, 15)
   });
-});
+}));
 
 // ---------- ads ----------
 
 // GET /api/ads/active — public. Returns active ads (no impression/click counts —
 // those are only exposed to the admin) so the frontend can pick one to display.
-app.get('/api/ads/active', async (req, res) => {
+app.get('/api/ads/active', asyncHandler(async (req, res) => {
   const data = await readAds();
   const active = data.ads.filter(a => a.active).map(publicAd);
   res.json({ ads: active });
-});
+}));
 
 // GET /api/ads/:id/click — records the click, then redirects to the advertiser's URL.
 // A plain link (not a JS fetch) so it works reliably in new tabs / with JS disabled.
-app.get('/api/ads/:id/click', perMinute(120), async (req, res) => {
+app.get('/api/ads/:id/click', perMinute(120), asyncHandler(async (req, res) => {
   const data = await readAds();
   const ad = data.ads.find(a => a.id === req.params.id);
   if (!ad || !ad.active) return res.status(404).json({ error: 'Ad not found.' });
   ad.clicks = (ad.clicks || 0) + 1;
   writeAds(data).catch(() => {});
   res.redirect(302, ad.linkUrl);
-});
+}));
 
 // POST /api/ads/:id/impression — fired once when an ad is actually shown.
-app.post('/api/ads/:id/impression', perMinute(120), async (req, res) => {
+app.post('/api/ads/:id/impression', perMinute(120), asyncHandler(async (req, res) => {
   const data = await readAds();
   const ad = data.ads.find(a => a.id === req.params.id);
   if (!ad) return res.status(404).json({ error: 'Ad not found.' });
@@ -293,16 +298,16 @@ app.post('/api/ads/:id/impression', perMinute(120), async (req, res) => {
   writeAds(data)
     .then(() => res.json({ ok: true }))
     .catch(() => res.status(500).json({ error: 'Could not record impression.' }));
-});
+}));
 
 // GET /api/ads — admin: full list including stats, active or not.
-app.get('/api/ads', requireAdmin, async (req, res) => {
+app.get('/api/ads', requireAdmin, asyncHandler(async (req, res) => {
   const data = await readAds();
   res.json({ ads: data.ads });
-});
+}));
 
 // POST /api/ads — admin: create a new ad.
-app.post('/api/ads', requireAdmin, async (req, res) => {
+app.post('/api/ads', requireAdmin, asyncHandler(async (req, res) => {
   const body = req.body || {};
   const advertiser = clip(body.advertiser, MAX_ADVERTISER_LEN);
   const headline = clip(body.headline, MAX_HEADLINE_LEN);
@@ -329,10 +334,10 @@ app.post('/api/ads', requireAdmin, async (req, res) => {
   writeAds(data)
     .then(() => res.status(201).json({ ad }))
     .catch(() => res.status(500).json({ error: 'Could not save ad.' }));
-});
+}));
 
 // PATCH /api/ads/:id — admin: edit fields or toggle active.
-app.patch('/api/ads/:id', requireAdmin, async (req, res) => {
+app.patch('/api/ads/:id', requireAdmin, asyncHandler(async (req, res) => {
   const data = await readAds();
   const ad = data.ads.find(a => a.id === req.params.id);
   if (!ad) return res.status(404).json({ error: 'Ad not found.' });
@@ -355,10 +360,10 @@ app.patch('/api/ads/:id', requireAdmin, async (req, res) => {
   writeAds(data)
     .then(() => res.json({ ad }))
     .catch(() => res.status(500).json({ error: 'Could not update ad.' }));
-});
+}));
 
 // DELETE /api/ads/:id — admin: remove an ad entirely.
-app.delete('/api/ads/:id', requireAdmin, async (req, res) => {
+app.delete('/api/ads/:id', requireAdmin, asyncHandler(async (req, res) => {
   const data = await readAds();
   const before = data.ads.length;
   data.ads = data.ads.filter(a => a.id !== req.params.id);
@@ -366,12 +371,12 @@ app.delete('/api/ads/:id', requireAdmin, async (req, res) => {
   writeAds(data)
     .then(() => res.json({ ok: true }))
     .catch(() => res.status(500).json({ error: 'Could not delete ad.' }));
-});
+}));
 
 // ---------- auth ----------
 
 // POST /api/auth/signup — free, plain accounts, no roles.
-app.post('/api/auth/signup', perMinute(10), async (req, res) => {
+app.post('/api/auth/signup', perMinute(10), asyncHandler(async (req, res) => {
   const body = req.body || {};
   const username = clip(body.username, 30);
   const email = clip(body.email, 200).toLowerCase();
@@ -400,10 +405,10 @@ app.post('/api/auth/signup', perMinute(10), async (req, res) => {
       res.status(201).json({ token, user: publicUser(user) });
     })
     .catch(() => res.status(500).json({ error: 'Could not create account.' }));
-});
+}));
 
 // POST /api/auth/login
-app.post('/api/auth/login', perMinute(20), async (req, res) => {
+app.post('/api/auth/login', perMinute(20), asyncHandler(async (req, res) => {
   const body = req.body || {};
   const email = clip(body.email, 200).toLowerCase();
   const password = String(body.password || '');
@@ -416,7 +421,7 @@ app.post('/api/auth/login', perMinute(20), async (req, res) => {
   const token = crypto.randomBytes(24).toString('hex');
   sessions.set(token, user.id);
   res.json({ token, user: publicUser(user) });
-});
+}));
 
 // POST /api/auth/logout
 app.post('/api/auth/logout', (req, res) => {
@@ -428,22 +433,22 @@ app.post('/api/auth/logout', (req, res) => {
 
 // ---------- QOTD + leaderboard ----------
 
-app.get('/api/qotd', async (req, res) => {
+app.get('/api/qotd', asyncHandler(async (req, res) => {
   const data = await readQotd();
   res.json({ qotd: data.qotd });
-});
+}));
 
-app.get('/api/leaderboard', async (req, res) => {
+app.get('/api/leaderboard', asyncHandler(async (req, res) => {
   const data = await readUsers();
   const leaderboard = data.users
     .map(u => ({ username: u.username, contributionScore: u.contributionScore || 0 }))
     .filter(u => u.contributionScore > 0)
     .sort((a, b) => b.contributionScore - a.contributionScore);
   res.json({ leaderboard });
-});
+}));
 
 // POST /api/qotd — only the current top contributor can set it
-app.post('/api/qotd', requireAuth, perMinute(10), async (req, res) => {
+app.post('/api/qotd', requireAuth, perMinute(10), asyncHandler(async (req, res) => {
   const question = clip((req.body || {}).question, MAX_QUESTION_LEN);
   if (!question) return res.status(400).json({ error: 'Question is required.' });
 
@@ -458,10 +463,10 @@ app.post('/api/qotd', requireAuth, perMinute(10), async (req, res) => {
   writeQotd({ qotd })
     .then(() => res.json({ qotd }))
     .catch(() => res.status(500).json({ error: 'Could not save the question.' }));
-});
+}));
 
 // GET /api/reviews?category=work&state=texas
-app.get('/api/reviews', async (req, res) => {
+app.get('/api/reviews', asyncHandler(async (req, res) => {
   const { category, state } = req.query;
   if (category && !isValidCategory(category)) {
     return res.status(400).json({ error: 'Unknown category.' });
@@ -472,10 +477,10 @@ app.get('/api/reviews', async (req, res) => {
   if (state) results = results.filter(r => r.state.toLowerCase() === String(state).toLowerCase());
   results = results.slice().sort((a, b) => b.timestamp - a.timestamp);
   res.json({ reviews: results });
-});
+}));
 
 // POST /api/reviews
-app.post('/api/reviews', requireAuth, perMinute(12), async (req, res) => {
+app.post('/api/reviews', requireAuth, perMinute(12), asyncHandler(async (req, res) => {
   const body = req.body || {};
   const category = body.category;
   const state = clip(body.state, 40);
@@ -513,10 +518,10 @@ app.post('/api/reviews', requireAuth, perMinute(12), async (req, res) => {
   Promise.all([writeData(data), writeUsers(usersData)])
     .then(() => res.status(201).json({ review }))
     .catch(() => res.status(500).json({ error: 'Could not save review.' }));
-});
+}));
 
 // POST /api/reviews/:id/like
-app.post('/api/reviews/:id/like', perMinute(60), async (req, res) => {
+app.post('/api/reviews/:id/like', perMinute(60), asyncHandler(async (req, res) => {
   const data = await readData();
   const review = data.reviews.find(r => r.id === req.params.id);
   if (!review) return res.status(404).json({ error: 'Review not found.' });
@@ -524,10 +529,10 @@ app.post('/api/reviews/:id/like', perMinute(60), async (req, res) => {
   writeData(data)
     .then(() => res.json({ review }))
     .catch(() => res.status(500).json({ error: 'Could not save like.' }));
-});
+}));
 
 // POST /api/reviews/:id/reply
-app.post('/api/reviews/:id/reply', requireAuth, perMinute(20), async (req, res) => {
+app.post('/api/reviews/:id/reply', requireAuth, perMinute(20), asyncHandler(async (req, res) => {
   const data = await readData();
   const review = data.reviews.find(r => r.id === req.params.id);
   if (!review) return res.status(404).json({ error: 'Review not found.' });
@@ -545,7 +550,7 @@ app.post('/api/reviews/:id/reply', requireAuth, perMinute(20), async (req, res) 
   Promise.all([writeData(data), writeUsers(usersData)])
     .then(() => res.json({ review }))
     .catch(() => res.status(500).json({ error: 'Could not save reply.' }));
-});
+}));
 
 // ---------- code scanner (public, report-only) ----------
 app.use(scannerRoutes);
@@ -564,6 +569,13 @@ app.use((err, req, res, next) => {
   }
   console.error(err);
   res.status(500).json({ error: 'Something went wrong.' });
+});
+
+// Defense-in-depth: every async route above is wrapped in asyncHandler, so this
+// should never fire in practice — but if a future route ever misses the wrapper,
+// log it instead of letting Node terminate the whole process (default since Node 15).
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (should not happen — check asyncHandler coverage):', reason);
 });
 
 app.listen(PORT, () => {
