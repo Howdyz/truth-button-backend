@@ -14,12 +14,26 @@
 //   UPSTASH_REDIS_REST_TOKEN  — Upstash Redis REST token.
 //   Without the two Upstash vars set, storage falls back to an in-memory store
 //   (fine for local dev/testing — NOT persistent, resets on every restart).
+//   STRIPE_DOWNLOADER_SECRET_KEY — Stripe secret key (sk_live_... or sk_test_...) for the Lightning
+//                               Downloader unlock specifically. Deliberately separate from any other
+//                               Stripe key already in use elsewhere (e.g. donations) — a Stripe secret
+//                               key is account-wide, but keeping this one distinctly named means it can
+//                               never be accidentally overwritten by or collide with another feature's
+//                               credentials. Unset = checkout disabled (trial still works, unlock button
+//                               errors).
+//   STRIPE_DOWNLOADER_WEBHOOK_SECRET — signing secret for the /api/downloader/webhook endpoint, from
+//                               the Stripe Dashboard webhook you point at that URL. Each Stripe webhook
+//                               endpoint has its own unique secret, so this must stay separate from any
+//                               other webhook's secret too. Required to actually mark an account
+//                               unlocked after payment — without it, paid sessions are never confirmed.
+//   FRONTEND_URL              — where Stripe Checkout redirects after payment (default: the live site).
 
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
+const Stripe = require('stripe');
 const scannerRoutes = require('./scanner/publicRoutes');
 
 // Express 4 does NOT catch a rejected promise from an async handler — it becomes an
@@ -32,6 +46,17 @@ function asyncHandler(fn){
 }
 
 const PORT = process.env.PORT || 3000;
+
+// ---------- Lightning Downloader unlock: Stripe (one-time payment, no pre-created Price needed —
+// the amount is defined inline in the Checkout Session below) ----------
+const STRIPE_DOWNLOADER_SECRET_KEY = process.env.STRIPE_DOWNLOADER_SECRET_KEY;
+const STRIPE_DOWNLOADER_WEBHOOK_SECRET = process.env.STRIPE_DOWNLOADER_WEBHOOK_SECRET;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://projectsilverbeam.com';
+const DOWNLOADER_UNLOCK_PRICE_USD = 1000; // $10.00, in cents
+const stripe = STRIPE_DOWNLOADER_SECRET_KEY ? new Stripe(STRIPE_DOWNLOADER_SECRET_KEY) : null;
+if (!STRIPE_DOWNLOADER_SECRET_KEY) {
+  console.warn('STRIPE_DOWNLOADER_SECRET_KEY not set — Lightning Downloader unlock checkout is disabled.');
+}
 
 const ALLOWED_CATEGORIES = ['work', 'sports', 'restaurants', 'prices', 'economy'];
 const MAX_TEXT_LEN = 2000;
@@ -128,7 +153,7 @@ function verifyPassword(password, stored){
 function isValidEmail(email){ return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email); }
 
 function publicUser(user){
-  return { id: user.id, username: user.username, contributionScore: user.contributionScore || 0 };
+  return { id: user.id, username: user.username, contributionScore: user.contributionScore || 0, downloaderUnlocked: !!user.downloaderUnlocked };
 }
 
 const requireAuth = asyncHandler(async (req, res, next) => {
@@ -188,6 +213,36 @@ app.set('trust proxy', 1); // Render sits behind a reverse proxy — without thi
 app.disable('x-powered-by');
 
 app.use(helmet());
+
+// Stripe webhook needs the raw, unparsed request body to verify the signature —
+// it MUST be registered before the global express.json() below, or that middleware
+// would consume/transform the body first and signature verification would fail.
+app.post('/api/downloader/webhook', express.raw({ type: 'application/json' }), asyncHandler(async (req, res) => {
+  if (!stripe || !STRIPE_DOWNLOADER_WEBHOOK_SECRET) return res.status(503).send('Webhook not configured.');
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_DOWNLOADER_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send('Webhook signature verification failed.');
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const userId = session.client_reference_id;
+    if (userId) {
+      const data = await readUsers();
+      const user = data.users.find(u => u.id === userId);
+      if (user && !user.downloaderUnlocked) {
+        user.downloaderUnlocked = true;
+        user.downloaderUnlockedAt = Date.now();
+        await writeUsers(data);
+      }
+    }
+  }
+
+  res.json({ received: true });
+}));
 
 app.use(express.json({ limit: '100kb' }));
 
@@ -430,6 +485,40 @@ app.post('/api/auth/logout', (req, res) => {
   if (token) sessions.delete(token);
   res.json({ ok: true });
 });
+
+// ---------- Lightning Downloader unlock ----------
+
+// POST /api/downloader/checkout — signed-in only. Creates a Stripe Checkout session for
+// the one-time unlock and returns its URL; the frontend opens it in a new tab so the
+// original tab's in-memory session survives (this site doesn't persist auth across reloads).
+app.post('/api/downloader/checkout', requireAuth, perMinute(10), asyncHandler(async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Payments are not configured on this server yet.' });
+  if (req.user.downloaderUnlocked) return res.status(400).json({ error: 'Already unlocked.' });
+
+  const session = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    payment_method_types: ['card'],
+    line_items: [{
+      price_data: {
+        currency: 'usd',
+        product_data: { name: 'Lightning Downloader — Lifetime Unlock' },
+        unit_amount: DOWNLOADER_UNLOCK_PRICE_USD
+      },
+      quantity: 1
+    }],
+    client_reference_id: req.user.id,
+    success_url: `${FRONTEND_URL}/index.html?mode=downloader&paid=1`,
+    cancel_url: `${FRONTEND_URL}/index.html?mode=downloader`
+  });
+
+  res.json({ url: session.url });
+}));
+
+// GET /api/downloader/status — signed-in only. Lets the frontend re-check unlock status
+// on demand (e.g. after returning from Stripe) without requiring a fresh login.
+app.get('/api/downloader/status', requireAuth, asyncHandler(async (req, res) => {
+  res.json({ unlocked: !!req.user.downloaderUnlocked });
+}));
 
 // ---------- QOTD + leaderboard ----------
 
