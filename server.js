@@ -229,8 +229,17 @@ app.post('/api/downloader/webhook', express.raw({ type: 'application/json' }), a
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
+    // This webhook is account-wide in Stripe — it would also fire for ANY other
+    // Checkout session ever created on this account (e.g. if donations moves off
+    // the static Payment Link to real Checkout someday). The metadata tag is what
+    // actually scopes this to "the downloader was paid for," not just the presence
+    // of a client_reference_id. Also require payment_status === 'paid' rather than
+    // trusting "completed" alone — completed can fire before an async payment
+    // method (bank debit, etc.) actually clears, though card payments (the only
+    // method offered here) are always synchronous so this is defense-in-depth.
+    const isDownloaderUnlock = session.metadata && session.metadata.product === 'downloader-unlock';
     const userId = session.client_reference_id;
-    if (userId) {
+    if (isDownloaderUnlock && session.payment_status === 'paid' && userId) {
       const data = await readUsers();
       const user = data.users.find(u => u.id === userId);
       if (user && !user.downloaderUnlocked) {
@@ -486,6 +495,18 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
+// DELETE /api/auth/account — signed-in only, self-service. Permanently removes the
+// caller's own account and invalidates their session. Doesn't touch reviews/replies
+// they've posted (those keep their username as free text, same as if any other
+// historical author record disappeared) — just the account + login credentials.
+app.delete('/api/auth/account', requireAuth, asyncHandler(async (req, res) => {
+  const data = await readUsers();
+  data.users = data.users.filter(u => u.id !== req.user.id);
+  await writeUsers(data);
+  sessions.delete(req.token);
+  res.json({ ok: true });
+}));
+
 // ---------- Lightning Downloader unlock ----------
 
 // POST /api/downloader/checkout — signed-in only. Creates a Stripe Checkout session for
@@ -507,6 +528,7 @@ app.post('/api/downloader/checkout', requireAuth, perMinute(10), asyncHandler(as
       quantity: 1
     }],
     client_reference_id: req.user.id,
+    metadata: { product: 'downloader-unlock' }, // scopes the webhook to only this checkout flow — see the webhook handler
     success_url: `${FRONTEND_URL}/index.html?mode=downloader&paid=1`,
     cancel_url: `${FRONTEND_URL}/index.html?mode=downloader`
   });
