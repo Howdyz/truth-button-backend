@@ -69,6 +69,7 @@ const MAX_ADVERTISER_LEN = 60;
 const MAX_HEADLINE_LEN = 100;
 const MAX_AD_BODY_LEN = 200;
 const MAX_URL_LEN = 500;
+const MAX_QR_LABEL_LEN = 80;
 
 // ---------- storage: Upstash Redis REST API, with an in-memory fallback for local dev ----------
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
@@ -116,6 +117,8 @@ function readVisits(){ return storeGet('tb:visits', { totalViews: 0, byDay: {}, 
 function writeVisits(data){ return storeSet('tb:visits', data); }
 function readAds(){ return storeGet('tb:ads', { ads: [] }); }
 function writeAds(data){ return storeSet('tb:ads', data); }
+function readQrLinks(){ return storeGet('tb:qrlinks', { links: [] }); }
+function writeQrLinks(data){ return storeSet('tb:qrlinks', data); }
 
 // ---------- helpers ----------
 function makeId(){
@@ -125,6 +128,19 @@ function makeId(){
 function clip(str, max){
   if (typeof str !== 'string') return '';
   return str.slice(0, max).trim();
+}
+
+// Proper HTML escaping — safe for BOTH text-content and attribute-value
+// contexts (unlike the frontend's textContent/innerHTML round-trip, which
+// only escapes for text content and was the root of an XSS found in an
+// earlier audit). Used for the server-rendered /go/:id interstitial page.
+function escapeHtmlServer(str){
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function isValidCategory(c){ return ALLOWED_CATEGORIES.includes(c); }
@@ -540,6 +556,122 @@ app.post('/api/downloader/checkout', requireAuth, perMinute(10), asyncHandler(as
 // on demand (e.g. after returning from Stripe) without requiring a fresh login.
 app.get('/api/downloader/status', requireAuth, asyncHandler(async (req, res) => {
   res.json({ unlocked: !!req.user.downloaderUnlocked });
+}));
+
+// ---------- QR trackable landing pages ----------
+// Signed-in only to create (see comment on the route below for why an open
+// URL-redirect creator on this domain would be a real abuse risk). Public to
+// visit — that's the whole point, someone scans a QR code and lands here.
+
+function makeShortId(){
+  return Math.random().toString(36).slice(2, 8) + Math.random().toString(36).slice(2, 4);
+}
+
+function qrLandingPageHtml({ destinationUrl, label, ownerName }){
+  const safeUrl = escapeHtmlServer(destinationUrl);
+  const safeLabel = label ? escapeHtmlServer(label) : '';
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex">
+<title>${safeLabel ? safeLabel + ' — ' : ''}Continue via The Truth Button</title>
+<style>
+  body{margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:#14110F; color:#F2EDE1; font-family:system-ui,-apple-system,sans-serif;}
+  .card{max-width:440px; margin:24px; padding:32px; background:#1C1814; border:1px solid rgba(242,237,225,0.14); border-radius:12px; text-align:center;}
+  .kicker{font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#E8C23C; margin-bottom:14px;}
+  h1{font-size:20px; margin:0 0 10px;}
+  .dest{font-size:13px; color:#8C8377; word-break:break-all; margin-bottom:24px;}
+  a.go{display:inline-block; background:#2F8F7A; color:#14110F; text-decoration:none; padding:14px 28px; border-radius:6px; font-weight:700; font-size:14px;}
+  a.go:hover{opacity:0.9;}
+  .offramp{margin-top:28px; padding-top:20px; border-top:1px solid rgba(242,237,225,0.14); font-size:12px; color:#8C8377;}
+  .offramp a{color:#2F8F7A; text-decoration:none;}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="kicker">Shared via The Truth Button</div>
+    <h1>${safeLabel || 'This link is ready for you'}</h1>
+    <div class="dest">${safeUrl}</div>
+    <a class="go" href="${safeUrl}" target="_blank" rel="noopener">Continue →</a>
+    <div class="offramp">🔍 Also on <a href="/">The Truth Button</a> — free tools to check if photos/video are AI-generated, look up surveillance cameras, scan code for malware, and more.</div>
+  </div>
+</body>
+</html>`;
+}
+
+function qrNotFoundHtml(){
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="robots" content="noindex">
+<title>Link not found — The Truth Button</title>
+<style>body{margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:#14110F; color:#F2EDE1; font-family:system-ui,-apple-system,sans-serif;}
+.card{max-width:400px; margin:24px; padding:32px; background:#1C1814; border:1px solid rgba(242,237,225,0.14); border-radius:12px; text-align:center;}
+a{color:#2F8F7A;}</style></head>
+<body><div class="card"><h1>Link not found</h1><p>This QR code link doesn't exist or was removed.</p><a href="/">Go to The Truth Button →</a></div></body></html>`;
+}
+
+// POST /api/qrlinks — signed-in only. An open, unauthenticated URL-redirect
+// creator on a trusted domain is a well-known phishing/spam vector (the
+// domain's reputation gets borrowed for whatever the redirect actually points
+// at). Requiring sign-in ties every link to an accountable identity.
+app.post('/api/qrlinks', requireAuth, perMinute(20), asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const rawUrl = clip(body.url, MAX_URL_LEN);
+  const label = clip(body.label, MAX_QR_LABEL_LEN);
+
+  if (!isValidHttpUrl(rawUrl)) return res.status(400).json({ error: 'A valid http(s) URL is required.' });
+  const normalizedUrl = new URL(rawUrl).href; // normalizes + percent-encodes, avoids storing a raw/malformed string
+
+  const data = await readQrLinks();
+  let id;
+  do { id = makeShortId(); } while (data.links.some(l => l.id === id));
+
+  const link = {
+    id, userId: req.user.id, destinationUrl: normalizedUrl, label: label || null,
+    clicks: 0, createdAt: Date.now()
+  };
+  data.links.push(link);
+  writeQrLinks(data)
+    .then(() => res.status(201).json({ id, shortUrl: `${req.protocol}://${req.get('host')}/go/${id}` }))
+    .catch(() => res.status(500).json({ error: 'Could not save the link.' }));
+}));
+
+// GET /go/:id — public. Serves the branded interstitial (or a friendly 404),
+// then the visitor clicks through to the actual destination themselves —
+// deliberately not an instant redirect, since the whole point is the
+// off-ramp content actually gets seen.
+app.get('/go/:id', perMinute(120), asyncHandler(async (req, res) => {
+  const data = await readQrLinks();
+  const link = data.links.find(l => l.id === req.params.id);
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  if (!link) return res.status(404).send(qrNotFoundHtml());
+
+  link.clicks = (link.clicks || 0) + 1;
+  writeQrLinks(data).catch(() => {}); // best-effort; don't block the page on this
+  res.send(qrLandingPageHtml({ destinationUrl: link.destinationUrl, label: link.label }));
+}));
+
+// GET /api/qrlinks — signed-in only. Lets a user see their own links + click counts.
+app.get('/api/qrlinks', requireAuth, asyncHandler(async (req, res) => {
+  const data = await readQrLinks();
+  const mine = data.links
+    .filter(l => l.userId === req.user.id)
+    .map(l => ({ id: l.id, destinationUrl: l.destinationUrl, label: l.label, clicks: l.clicks || 0, createdAt: l.createdAt }))
+    .sort((a, b) => b.createdAt - a.createdAt);
+  res.json({ links: mine });
+}));
+
+// DELETE /api/qrlinks/:id — signed-in only, owner-only.
+app.delete('/api/qrlinks/:id', requireAuth, asyncHandler(async (req, res) => {
+  const data = await readQrLinks();
+  const link = data.links.find(l => l.id === req.params.id);
+  if (!link) return res.status(404).json({ error: 'Link not found.' });
+  if (link.userId !== req.user.id) return res.status(403).json({ error: 'Not your link.' });
+  data.links = data.links.filter(l => l.id !== req.params.id);
+  writeQrLinks(data)
+    .then(() => res.json({ ok: true }))
+    .catch(() => res.status(500).json({ error: 'Could not delete the link.' }));
 }));
 
 // ---------- QOTD + leaderboard ----------
