@@ -1108,6 +1108,21 @@ app.post('/api/reviews/:id/reply', requireAuth, perMinute(20), asyncHandler(asyn
     .catch(() => res.status(500).json({ error: 'Could not save reply.' }));
 }));
 
+// DELETE /api/reviews/:id — admin only (same ADMIN_SECRET gate as ads/stats). There's
+// no self-service delete for review authors — moderation is deliberately admin-only,
+// same reasoning as the ads CRUD routes above. Existed as a real gap: account deletion
+// intentionally leaves a user's reviews in place (see DELETE /api/auth/account), but
+// there was previously no way to remove a review at all, including test/junk content.
+app.delete('/api/reviews/:id', requireAdmin, asyncHandler(async (req, res) => {
+  const data = await readData();
+  const before = data.reviews.length;
+  data.reviews = data.reviews.filter(r => r.id !== req.params.id);
+  if (data.reviews.length === before) return res.status(404).json({ error: 'Review not found.' });
+  writeData(data)
+    .then(() => res.json({ ok: true }))
+    .catch(() => res.status(500).json({ error: 'Could not delete review.' }));
+}));
+
 // ---------- code scanner (public, report-only) ----------
 app.use(scannerRoutes);
 
