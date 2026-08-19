@@ -70,6 +70,8 @@ const MAX_HEADLINE_LEN = 100;
 const MAX_AD_BODY_LEN = 200;
 const MAX_URL_LEN = 500;
 const MAX_QR_LABEL_LEN = 80;
+const MAX_PHOTO_BASE64_LEN = 1500000; // ~1.5MB of base64 text (~1.1MB binary) — plenty for a client-compressed JPEG
+const PHOTO_TTL_SECONDS = 60 * 60 * 24 * 90; // hosted photos auto-expire after 90 days
 
 // ---------- storage: Upstash Redis REST API, with an in-memory fallback for local dev ----------
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
@@ -105,6 +107,28 @@ async function storeSet(key, value){
     body: JSON.stringify(value)
   });
   if (!res.ok) throw new Error('Redis SET failed: ' + res.status);
+}
+
+async function storeSetWithTTL(key, value, ttlSeconds){
+  if (!REDIS_URL || !REDIS_TOKEN) {
+    memoryStore.set(key, value);
+    // setTimeout's delay is a 32-bit signed int internally — anything longer (90 days in ms
+    // overflows it) silently clamps to ~1ms instead of throwing, deleting the entry almost
+    // immediately. Cap at the max safe delay; this is the dev-only fallback anyway (data
+    // doesn't survive a restart regardless), so an eventual-but-not-exact expiry is fine.
+    if (ttlSeconds) setTimeout(() => memoryStore.delete(key), Math.min(ttlSeconds * 1000, 2147483647)).unref();
+    return;
+  }
+  const res = await fetch(`${REDIS_URL}/set/${encodeURIComponent(key)}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'text/plain' },
+    body: JSON.stringify(value)
+  });
+  if (!res.ok) throw new Error('Redis SET failed: ' + res.status);
+  const exRes = await fetch(`${REDIS_URL}/expire/${encodeURIComponent(key)}/${ttlSeconds}`, {
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+  });
+  if (!exRes.ok) throw new Error('Redis EXPIRE failed: ' + exRes.status);
 }
 
 function readData(){ return storeGet('tb:reviews', { reviews: [] }); }
@@ -230,6 +254,22 @@ app.disable('x-powered-by');
 
 app.use(helmet());
 
+// CORS needs to be mounted before ANY route (not just before the global express.json()
+// below) — a route registered earlier than this in the stack (like the Stripe webhook,
+// or /api/photos, both special-cased to run before the global json() body-size limit)
+// would otherwise send its real response with no CORS headers at all. The browser's
+// preflight OPTIONS request wouldn't catch this, since OPTIONS doesn't match a
+// method-specific app.post() route and falls through to here regardless — only the
+// actual POST/GET response would silently fail client-side. Found via a real browser
+// test on /api/photos: preflight succeeded, the real POST failed with net::ERR_FAILED.
+const allowedOrigin = process.env.ALLOWED_ORIGIN;
+if (allowedOrigin) {
+  const origins = allowedOrigin.split(',').map(o => o.trim());
+  app.use(cors({ origin: origins }));
+} else {
+  app.use(cors()); // open for easy first-time setup; lock down with ALLOWED_ORIGIN in production
+}
+
 // Stripe webhook needs the raw, unparsed request body to verify the signature —
 // it MUST be registered before the global express.json() below, or that middleware
 // would consume/transform the body first and signature verification would fail.
@@ -269,15 +309,36 @@ app.post('/api/downloader/webhook', express.raw({ type: 'application/json' }), a
   res.json({ received: true });
 }));
 
-app.use(express.json({ limit: '100kb' }));
+// POST /api/photos — signed-in only. Lets a user host a single photo (already
+// compressed client-side to a data URL) to get a public URL — built for the Share
+// Page tool, since Facebook/etc. need a real https og:image URL and most people
+// don't have one handy. Reuses the existing Upstash Redis storage, no new
+// credentials needed. Registered here, with its own json() limit, and BEFORE the
+// global 100kb one below — same reason as the Stripe webhook above: a compressed
+// photo is bigger than this site's normal JSON payloads, so it needs its own parser
+// ahead of the stricter global default. Sign-in is required for the same reason QR
+// trackable links require it: an open, anyone-can-host-anything endpoint on a
+// trusted domain is a real abuse vector (illegal/abusive content, bandwidth theft),
+// and tying every upload to an account makes it accountable/revocable.
+app.post('/api/photos', express.json({ limit: '2mb' }), requireAuth, perMinute(10), asyncHandler(async (req, res) => {
+  const dataUrl = (req.body || {}).dataUrl;
+  const match = typeof dataUrl === 'string' && dataUrl.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
+  if (!match) return res.status(400).json({ error: 'Expected a JPEG, PNG, or WebP image.' });
+  const mime = 'image/' + match[1];
+  const base64 = match[2];
+  if (base64.length > MAX_PHOTO_BASE64_LEN) return res.status(413).json({ error: 'Photo is too large — try a smaller or more compressed image.' });
 
-const allowedOrigin = process.env.ALLOWED_ORIGIN;
-if (allowedOrigin) {
-  const origins = allowedOrigin.split(',').map(o => o.trim());
-  app.use(cors({ origin: origins }));
-} else {
-  app.use(cors()); // open for easy first-time setup; lock down with ALLOWED_ORIGIN in production
-}
+  let id, exists;
+  do {
+    id = makeShortId();
+    exists = await storeGet('tb:photo:' + id, null);
+  } while (exists);
+
+  await storeSetWithTTL('tb:photo:' + id, { id, userId: req.user.id, mime, base64, createdAt: Date.now() }, PHOTO_TTL_SECONDS);
+  res.status(201).json({ id, url: `${req.protocol}://${req.get('host')}/photos/${id}`, expiresInDays: PHOTO_TTL_SECONDS / 86400 });
+}));
+
+app.use(express.json({ limit: '100kb' }));
 
 // per-route rate limiting (express-rate-limit: bounded memory, auto-expiring buckets —
 // unlike a hand-rolled version, old IPs don't linger forever and leak memory)
@@ -650,6 +711,24 @@ app.get('/go/:id', perMinute(120), asyncHandler(async (req, res) => {
   link.clicks = (link.clicks || 0) + 1;
   writeQrLinks(data).catch(() => {}); // best-effort; don't block the page on this
   res.send(qrLandingPageHtml({ destinationUrl: link.destinationUrl, label: link.label }));
+}));
+
+// GET /photos/:id — public. Serves the actual image bytes for a photo hosted via
+// POST /api/photos (see that route, registered early, for why/how). Not
+// found/expired just 404s with plain text — fine for an <img src>, it shows as a
+// broken image rather than needing special handling.
+app.get('/photos/:id', perMinute(300), asyncHandler(async (req, res) => {
+  const photo = await storeGet('tb:photo:' + req.params.id, null);
+  if (!photo) return res.status(404).type('text/plain').send('Not found or expired.');
+  res.set('Content-Type', photo.mime);
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  // helmet's default Cross-Origin-Resource-Policy is "same-origin", which blocks
+  // browsers (not bots like Facebook's crawler, which ignores it) from loading this
+  // as a cross-origin <img>. The entire point of this route is to be embedded
+  // elsewhere, so it needs the permissive value — found via a real browser test
+  // where the URL worked fine via curl/a scraper but silently failed as an <img src>.
+  res.set('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.send(Buffer.from(photo.base64, 'base64'));
 }));
 
 // GET /api/qrlinks — signed-in only. Lets a user see their own links + click counts.
