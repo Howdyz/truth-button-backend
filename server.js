@@ -33,6 +33,8 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
+const dns = require('dns').promises;
+const net = require('net');
 const Stripe = require('stripe');
 const scannerRoutes = require('./scanner/publicRoutes');
 
@@ -171,6 +173,17 @@ function escapeHtmlServer(str){
     .replace(/'/g, '&#39;');
 }
 
+// Mirrors the frontend's stateSlug() (index.html) — the review `state` field ends up
+// in a `data-state="..."` HTML attribute client-side, which is exactly the attribute
+// context that caused a real stored XSS before that frontend fix was added. Restricting
+// the character set here too means the server no longer depends entirely on the
+// frontend continuing to get that escaping right forever; legitimate submissions
+// through the UI already only ever send slug-shaped values, so this is a no-op for
+// real usage and only affects malformed/direct-API-call input.
+function serverStateSlug(str){
+  return String(str == null ? '' : str).toLowerCase().trim().replace(/[^a-z0-9-]/g, '').slice(0, 40);
+}
+
 function isValidCategory(c){ return ALLOWED_CATEGORIES.includes(c); }
 
 // ---------- auth: password hashing (scrypt, no extra dependency) + bearer-token sessions ----------
@@ -247,6 +260,65 @@ function isValidHttpUrl(str){
   }
 }
 
+// ---------- SSRF-adjacent guard for user-supplied destination/image URLs ----------
+// Share pages and QR links embed user-chosen URLs into server-rendered HTML, which
+// third-party crawlers (Facebook, Slack, LinkedIn, etc.) then fetch on THEIR own
+// infrastructure — we never fetch these ourselves, so this isn't classic SSRF against
+// this server. But it does mean a signed-in user could point a big platform's crawler
+// at an internal/private address. This rejects known-private/reserved IP ranges before
+// storing the URL. Known limitation: this is a point-in-time check (resolved once, at
+// creation), not re-validated whenever a crawler actually fetches later — a DNS-rebinding
+// attack could in theory swap the address afterward. Full protection would require
+// re-checking at fetch time, which isn't possible here since we're never the one fetching;
+// this raises the bar significantly without needing to be airtight, given sign-in already
+// provides accountability for who created the link.
+function isPrivateIPv4(ip){
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some(p => !Number.isInteger(p) || p < 0 || p > 255)) return true; // malformed — treat as unsafe
+  const [a, b] = parts;
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true; // link-local, includes cloud metadata (169.254.169.254)
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking range
+  if (a >= 224) return true; // multicast + reserved
+  return false;
+}
+
+function isPrivateIPv6(ip){
+  const lower = ip.toLowerCase();
+  if (lower === '::1' || lower === '::') return true;
+  if (lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd')) return true;
+  if (lower.startsWith('::ffff:')) {
+    const mapped = lower.slice(7);
+    if (net.isIPv4(mapped)) return isPrivateIPv4(mapped);
+  }
+  return false;
+}
+
+function isPrivateIP(ip){
+  if (net.isIPv4(ip)) return isPrivateIPv4(ip);
+  if (net.isIPv6(ip)) return isPrivateIPv6(ip);
+  return true; // unrecognized format — treat as unsafe
+}
+
+async function isSafePublicUrl(str){
+  let parsed;
+  try { parsed = new URL(str); } catch (e) { return false; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return false;
+  if (net.isIP(hostname)) return !isPrivateIP(hostname);
+  try {
+    const addresses = await dns.lookup(hostname, { all: true });
+    if (!addresses.length) return false;
+    return addresses.every(a => !isPrivateIP(a.address));
+  } catch (e) {
+    return false; // couldn't resolve — treat as unsafe rather than allowing it through
+  }
+}
+
 function publicAd(ad){
   return { id: ad.id, advertiser: ad.advertiser, headline: ad.headline, body: ad.body, imageUrl: ad.imageUrl || null };
 }
@@ -313,6 +385,27 @@ app.post('/api/downloader/webhook', express.raw({ type: 'application/json' }), a
   res.json({ received: true });
 }));
 
+// Verifies the decoded bytes actually match the claimed image type (magic-byte check),
+// rather than trusting the client-supplied data-URL prefix. Without this, the mime
+// regex below only constrains the base64 CHARSET, not the actual content — arbitrary
+// bytes could be stored and later served back under an image/* Content-Type. Mitigated
+// already by helmet's X-Content-Type-Options: nosniff (blocks browser content-sniffing)
+// and by SVG not being an allowed type (no SVG-script vector), but verifying real bytes
+// closes the gap properly instead of relying solely on those as a backstop.
+function isValidImageBytes(buffer, mime){
+  if (mime === 'image/jpeg') {
+    return buffer.length >= 3 && buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF;
+  }
+  if (mime === 'image/png') {
+    const sig = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    return buffer.length >= 8 && buffer.subarray(0, 8).equals(sig);
+  }
+  if (mime === 'image/webp') {
+    return buffer.length >= 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+  }
+  return false;
+}
+
 // POST /api/photos — signed-in only. Lets a user host a single photo (already
 // compressed client-side to a data URL) to get a public URL — built for the Share
 // Page tool, since Facebook/etc. need a real https og:image URL and most people
@@ -331,6 +424,9 @@ app.post('/api/photos', express.json({ limit: '2mb' }), requireAuth, perMinute(1
   const mime = 'image/' + match[1];
   const base64 = match[2];
   if (base64.length > MAX_PHOTO_BASE64_LEN) return res.status(413).json({ error: 'Photo is too large — try a smaller or more compressed image.' });
+
+  const decoded = Buffer.from(base64, 'base64');
+  if (!isValidImageBytes(decoded, mime)) return res.status(400).json({ error: 'That file doesn\'t look like a valid ' + mime.split('/')[1].toUpperCase() + ' image.' });
 
   let id, exists;
   do {
@@ -686,6 +782,7 @@ app.post('/api/qrlinks', requireAuth, perMinute(20), asyncHandler(async (req, re
   const label = clip(body.label, MAX_QR_LABEL_LEN);
 
   if (!isValidHttpUrl(rawUrl)) return res.status(400).json({ error: 'A valid http(s) URL is required.' });
+  if (!(await isSafePublicUrl(rawUrl))) return res.status(400).json({ error: 'That URL points to a private/internal address, which isn\'t allowed.' });
   const normalizedUrl = new URL(rawUrl).href; // normalizes + percent-encodes, avoids storing a raw/malformed string
 
   const data = await readQrLinks();
@@ -838,6 +935,8 @@ app.post('/api/shares', requireAuth, perMinute(20), asyncHandler(async (req, res
 
   if (!isValidHttpUrl(destUrl)) return res.status(400).json({ error: 'A valid http(s) destination URL is required.' });
   if (!isValidHttpUrl(imageUrl)) return res.status(400).json({ error: 'A valid http(s) photo URL is required.' });
+  if (!(await isSafePublicUrl(destUrl))) return res.status(400).json({ error: 'The destination URL points to a private/internal address, which isn\'t allowed.' });
+  if (!(await isSafePublicUrl(imageUrl))) return res.status(400).json({ error: 'The photo URL points to a private/internal address, which isn\'t allowed.' });
 
   const data = await readShares();
   let id;
@@ -940,7 +1039,7 @@ app.get('/api/reviews', asyncHandler(async (req, res) => {
 app.post('/api/reviews', requireAuth, perMinute(12), asyncHandler(async (req, res) => {
   const body = req.body || {};
   const category = body.category;
-  const state = clip(body.state, 40);
+  const state = serverStateSlug(body.state);
   const subject = clip(body.subject, MAX_SUBJECT_LEN);
   const text = clip(body.text, MAX_TEXT_LEN);
   const rating = parseInt(body.rating, 10);
