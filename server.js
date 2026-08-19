@@ -72,6 +72,8 @@ const MAX_URL_LEN = 500;
 const MAX_QR_LABEL_LEN = 80;
 const MAX_PHOTO_BASE64_LEN = 1500000; // ~1.5MB of base64 text (~1.1MB binary) — plenty for a client-compressed JPEG
 const PHOTO_TTL_SECONDS = 60 * 60 * 24 * 90; // hosted photos auto-expire after 90 days
+const MAX_SHARE_TITLE_LEN = 120;
+const MAX_SHARE_DESC_LEN = 300;
 
 // ---------- storage: Upstash Redis REST API, with an in-memory fallback for local dev ----------
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
@@ -143,6 +145,8 @@ function readAds(){ return storeGet('tb:ads', { ads: [] }); }
 function writeAds(data){ return storeSet('tb:ads', data); }
 function readQrLinks(){ return storeGet('tb:qrlinks', { links: [] }); }
 function writeQrLinks(data){ return storeSet('tb:qrlinks', data); }
+function readShares(){ return storeGet('tb:shares', { shares: [] }); }
+function writeShares(data){ return storeSet('tb:shares', data); }
 
 // ---------- helpers ----------
 function makeId(){
@@ -753,6 +757,135 @@ app.delete('/api/qrlinks/:id', requireAuth, asyncHandler(async (req, res) => {
   writeQrLinks(data)
     .then(() => res.json({ ok: true }))
     .catch(() => res.status(500).json({ error: 'Could not delete the link.' }));
+}));
+
+// ---------- Share pages (Open Graph cards, server-hosted) ----------
+// Same reasoning as QR trackable links above (open unauthenticated redirect/content
+// creators on a trusted domain are a spam/phishing vector) — signed-in only to create.
+//
+// This replaced an earlier version of this feature that generated a static HTML file
+// for the user to download and host themselves, with a placeholder og:url line they
+// had to remember to edit to wherever they ended up hosting it. In practice that
+// placeholder kept getting left in by accident, and an unfilled/invalid og:url was
+// enough to make Facebook's scraper fail to read ANY of the tags (not just the image —
+// title and description came back empty too). Hosting the page here instead means
+// og:url is always correct (the server knows its own URL) and there's no separate
+// hosting step to forget.
+
+function sharePageHtml({ selfUrl, destUrl, imageUrl, title, description }){
+  const safeTitle = escapeHtmlServer(title);
+  const safeDesc = escapeHtmlServer(description || '');
+  const safeImage = escapeHtmlServer(imageUrl);
+  const safeDest = escapeHtmlServer(destUrl);
+  const safeSelf = escapeHtmlServer(selfUrl);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${safeTitle}</title>
+<meta property="og:type" content="website">
+<meta property="og:url" content="${safeSelf}">
+<meta property="og:title" content="${safeTitle}">
+<meta property="og:description" content="${safeDesc}">
+<meta property="og:image" content="${safeImage}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${safeTitle}">
+<meta name="twitter:description" content="${safeDesc}">
+<meta name="twitter:image" content="${safeImage}">
+<style>
+  body{margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:#14110F; color:#F2EDE1; font-family:system-ui,-apple-system,sans-serif;}
+  .card{max-width:440px; margin:24px; padding:32px; background:#1C1814; border:1px solid rgba(242,237,225,0.14); border-radius:12px; text-align:center;}
+  img.preview{width:100%; border-radius:8px; margin-bottom:20px; display:block;}
+  .kicker{font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#E8C23C; margin-bottom:14px;}
+  h1{font-size:20px; margin:0 0 10px;}
+  .desc{font-size:13px; color:#8C8377; margin-bottom:24px;}
+  a.go{display:inline-block; background:#2F8F7A; color:#14110F; text-decoration:none; padding:14px 28px; border-radius:6px; font-weight:700; font-size:14px;}
+  a.go:hover{opacity:0.9;}
+  .offramp{margin-top:28px; padding-top:20px; border-top:1px solid rgba(242,237,225,0.14); font-size:12px; color:#8C8377;}
+  .offramp a{color:#2F8F7A; text-decoration:none;}
+</style>
+</head>
+<body>
+  <div class="card">
+    <img class="preview" src="${safeImage}" alt="">
+    <div class="kicker">Shared via The Truth Button</div>
+    <h1>${safeTitle}</h1>
+    ${safeDesc ? `<div class="desc">${safeDesc}</div>` : ''}
+    <a class="go" href="${safeDest}" target="_blank" rel="noopener">Continue →</a>
+    <div class="offramp">🔍 Also on <a href="/">The Truth Button</a> — free tools to check if photos/video are AI-generated, look up surveillance cameras, scan code for malware, and more.</div>
+  </div>
+</body>
+</html>`;
+}
+
+function shareNotFoundHtml(){
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="robots" content="noindex">
+<title>Page not found — The Truth Button</title>
+<style>body{margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:#14110F; color:#F2EDE1; font-family:system-ui,-apple-system,sans-serif;}
+.card{max-width:400px; margin:24px; padding:32px; background:#1C1814; border:1px solid rgba(242,237,225,0.14); border-radius:12px; text-align:center;}
+a{color:#2F8F7A;}</style></head>
+<body><div class="card"><h1>Page not found</h1><p>This share page doesn't exist or was removed.</p><a href="/">Go to The Truth Button →</a></div></body></html>`;
+}
+
+app.post('/api/shares', requireAuth, perMinute(20), asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const destUrl = clip(body.destUrl, MAX_URL_LEN);
+  const imageUrl = clip(body.imageUrl, MAX_URL_LEN);
+  const title = clip(body.title, MAX_SHARE_TITLE_LEN) || 'Take a look at this';
+  const description = clip(body.description, MAX_SHARE_DESC_LEN);
+
+  if (!isValidHttpUrl(destUrl)) return res.status(400).json({ error: 'A valid http(s) destination URL is required.' });
+  if (!isValidHttpUrl(imageUrl)) return res.status(400).json({ error: 'A valid http(s) photo URL is required.' });
+
+  const data = await readShares();
+  let id;
+  do { id = makeShortId(); } while (data.shares.some(s => s.id === id));
+
+  const share = {
+    id, userId: req.user.id,
+    destUrl: new URL(destUrl).href, imageUrl: new URL(imageUrl).href,
+    title, description, views: 0, createdAt: Date.now()
+  };
+  data.shares.push(share);
+  writeShares(data)
+    .then(() => res.status(201).json({ id, url: `${req.protocol}://${req.get('host')}/share/${id}` }))
+    .catch(() => res.status(500).json({ error: 'Could not save the share page.' }));
+}));
+
+app.get('/share/:id', perMinute(120), asyncHandler(async (req, res) => {
+  const data = await readShares();
+  const share = data.shares.find(s => s.id === req.params.id);
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  if (!share) return res.status(404).send(shareNotFoundHtml());
+
+  share.views = (share.views || 0) + 1;
+  writeShares(data).catch(() => {}); // best-effort; don't block the page on this
+  const selfUrl = `${req.protocol}://${req.get('host')}/share/${share.id}`;
+  res.send(sharePageHtml({ selfUrl, destUrl: share.destUrl, imageUrl: share.imageUrl, title: share.title, description: share.description }));
+}));
+
+// GET /api/shares — signed-in only. Lets a user see their own share pages + view counts.
+app.get('/api/shares', requireAuth, asyncHandler(async (req, res) => {
+  const data = await readShares();
+  const mine = data.shares
+    .filter(s => s.userId === req.user.id)
+    .map(s => ({ id: s.id, destUrl: s.destUrl, imageUrl: s.imageUrl, title: s.title, description: s.description, views: s.views || 0, createdAt: s.createdAt }))
+    .sort((a, b) => b.createdAt - a.createdAt);
+  res.json({ shares: mine });
+}));
+
+// DELETE /api/shares/:id — signed-in only, owner-only.
+app.delete('/api/shares/:id', requireAuth, asyncHandler(async (req, res) => {
+  const data = await readShares();
+  const share = data.shares.find(s => s.id === req.params.id);
+  if (!share) return res.status(404).json({ error: 'Share page not found.' });
+  if (share.userId !== req.user.id) return res.status(403).json({ error: 'Not your share page.' });
+  data.shares = data.shares.filter(s => s.id !== req.params.id);
+  writeShares(data)
+    .then(() => res.json({ ok: true }))
+    .catch(() => res.status(500).json({ error: 'Could not delete the share page.' }));
 }));
 
 // ---------- QOTD + leaderboard ----------
