@@ -718,16 +718,18 @@ app.get('/go/:id', perMinute(120), asyncHandler(async (req, res) => {
 // found/expired just 404s with plain text — fine for an <img src>, it shows as a
 // broken image rather than needing special handling.
 app.get('/photos/:id', perMinute(300), asyncHandler(async (req, res) => {
-  const photo = await storeGet('tb:photo:' + req.params.id, null);
-  if (!photo) return res.status(404).type('text/plain').send('Not found or expired.');
-  res.set('Content-Type', photo.mime);
-  res.set('Cache-Control', 'public, max-age=31536000, immutable');
   // helmet's default Cross-Origin-Resource-Policy is "same-origin", which blocks
   // browsers (not bots like Facebook's crawler, which ignores it) from loading this
   // as a cross-origin <img>. The entire point of this route is to be embedded
   // elsewhere, so it needs the permissive value — found via a real browser test
   // where the URL worked fine via curl/a scraper but silently failed as an <img src>.
+  // Set unconditionally (before the not-found check too) so a stale/broken <img src>
+  // fails as a normal broken image rather than an inconsistent CORP-blocked one.
   res.set('Cross-Origin-Resource-Policy', 'cross-origin');
+  const photo = await storeGet('tb:photo:' + req.params.id, null);
+  if (!photo) return res.status(404).type('text/plain').send('Not found or expired.');
+  res.set('Content-Type', photo.mime);
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
   res.send(Buffer.from(photo.base64, 'base64'));
 }));
 
