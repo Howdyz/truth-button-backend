@@ -720,6 +720,28 @@ app.delete('/api/auth/account', requireAuth, asyncHandler(async (req, res) => {
 
 // ---------- Lightning Downloader unlock ----------
 
+// PATCH /api/admin/downloader-unlock — admin-secret gated, not tied to any user
+// session. Lets the site owner grant the Lightning Downloader unlock to any
+// account by email without going through Stripe — for the owner's own testing,
+// or comping specific accounts. Real paying users still go through the normal
+// checkout/webhook flow below; this is a separate, admin-only door onto the
+// same `downloaderUnlocked` flag.
+app.patch('/api/admin/downloader-unlock', requireAdmin, asyncHandler(async (req, res) => {
+  const email = clip((req.body && req.body.email) || '', 200).toLowerCase();
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
+
+  const data = await readUsers();
+  const user = data.users.find(u => u.email === email);
+  if (!user) return res.status(404).json({ error: 'No account with that email.' });
+
+  user.downloaderUnlocked = true;
+  user.downloaderUnlockedAt = Date.now();
+  user.downloaderUnlockedVia = 'admin';
+  await writeUsers(data);
+
+  res.json({ ok: true, email: user.email, downloaderUnlocked: true });
+}));
+
 // POST /api/downloader/checkout — signed-in only. Creates a Stripe Checkout session for
 // the one-time unlock and returns its URL; the frontend opens it in a new tab so the
 // original tab's in-memory session survives (this site doesn't persist auth across reloads).
