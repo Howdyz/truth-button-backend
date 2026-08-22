@@ -735,7 +735,7 @@ app.delete('/api/auth/account', requireAuth, asyncHandler(async (req, res) => {
 // or comping specific accounts. Real paying users still go through the normal
 // checkout/webhook flow below; this is a separate, admin-only door onto the
 // same `downloaderUnlocked` flag.
-app.patch('/api/admin/downloader-unlock', requireAdmin, asyncHandler(async (req, res) => {
+app.patch('/api/admin/downloader-unlock', requireAdmin, perMinute(10), asyncHandler(async (req, res) => {
   const email = clip((req.body && req.body.email) || '', 200).toLowerCase();
   if (!isValidEmail(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
 
@@ -955,9 +955,28 @@ function normalizeUsPhoneNumber(input){
 // area codes could in principle have a match beyond that cap, which the
 // response says plainly (`truncated: true`) rather than silently.
 const FTC_API_KEY = process.env.FTC_DATA_GOV_API_KEY || 'DEMO_KEY';
-const SCAMID_MAX_PAGES = 10; // 10 * 50 = 500 most-recent complaints for that area code
+const SCAMID_MAX_PAGES = 6; // 6 * 50 = 300 most-recent complaints for that area code — lower
+                            // amplification per lookup than the original 10; still covers the
+                            // vast majority of real area codes, which never come close to this.
 
-app.get('/api/scamid/lookup/:number', perMinute(20), asyncHandler(async (req, res) => {
+// Global (not per-IP) budget on outbound FTC calls. The per-route rate limit
+// below only throttles how often ONE client can hit this server — it does
+// nothing to stop many different numbers/IPs from collectively exhausting
+// the site's single shared FTC_DATA_GOV_API_KEY, which would break the
+// feature for every visitor at once. This caps total upstream usage
+// regardless of how the requests are distributed. Resets on a rolling
+// hourly window; deliberately in-memory (a soft circuit breaker, not a
+// security-critical counter) rather than persisted to Redis.
+const FTC_HOURLY_BUDGET = 500;
+let ftcCallsThisWindow = 0;
+let ftcWindowStart = Date.now();
+function ftcBudgetAvailable(){
+  const now = Date.now();
+  if (now - ftcWindowStart > 3600000) { ftcCallsThisWindow = 0; ftcWindowStart = now; }
+  return ftcCallsThisWindow < FTC_HOURLY_BUDGET;
+}
+
+app.get('/api/scamid/lookup/:number', perMinute(10), asyncHandler(async (req, res) => {
   const number = normalizeUsPhoneNumber(req.params.number);
   if (!number) return res.status(400).json({ error: 'Enter a valid 10-digit US phone number.' });
 
@@ -974,6 +993,7 @@ app.get('/api/scamid/lookup/:number', perMinute(20), asyncHandler(async (req, re
   let ftcError = null;
   try {
     for (let page = 0; page < SCAMID_MAX_PAGES; page++) {
+      if (!ftcBudgetAvailable()) { ftcError = 'FTC lookups are temporarily limited — try again in a few minutes.'; break; }
       const params = new URLSearchParams({
         api_key: FTC_API_KEY,
         area_code: areaCode,
@@ -982,6 +1002,7 @@ app.get('/api/scamid/lookup/:number', perMinute(20), asyncHandler(async (req, re
         items_per_page: '50',
         offset: String(page * 50)
       });
+      ftcCallsThisWindow++;
       const resp = await fetch(`https://api.ftc.gov/v0/dnc-complaints?${params.toString()}`);
       if (!resp.ok) { ftcError = `FTC API returned ${resp.status}`; break; }
       const body = await resp.json();
