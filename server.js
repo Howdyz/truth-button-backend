@@ -26,6 +26,10 @@
 //                               endpoint has its own unique secret, so this must stay separate from any
 //                               other webhook's secret too. Required to actually mark an account
 //                               unlocked after payment — without it, paid sessions are never confirmed.
+//   STRIPE_DONATE_WEBHOOK_SECRET — signing secret for the /api/donate/webhook endpoint. Donations are
+//                               collected via a static Stripe Payment Link (not created by this backend),
+//                               so this webhook has nothing to trigger yet — it only verifies the
+//                               signature and acknowledges receipt. Unset = endpoint returns 503.
 //   FRONTEND_URL              — where Stripe Checkout redirects after payment (default: the live site).
 
 const express = require('express');
@@ -53,6 +57,11 @@ const PORT = process.env.PORT || 3000;
 // the amount is defined inline in the Checkout Session below) ----------
 const STRIPE_DOWNLOADER_SECRET_KEY = process.env.STRIPE_DOWNLOADER_SECRET_KEY;
 const STRIPE_DOWNLOADER_WEBHOOK_SECRET = process.env.STRIPE_DOWNLOADER_WEBHOOK_SECRET;
+// Donations run through a static Stripe Payment Link, not a Checkout Session this
+// backend creates — so there's no secret key needed here, only this endpoint's own
+// webhook signing secret. constructEvent() verifies signatures locally and doesn't
+// make an API call, so the downloader's `stripe` client below is reused as-is.
+const STRIPE_DONATE_WEBHOOK_SECRET = process.env.STRIPE_DONATE_WEBHOOK_SECRET;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://projectsilverbeam.com';
 const DOWNLOADER_UNLOCK_PRICE_USD = 1000; // $10.00, in cents
 const stripe = STRIPE_DOWNLOADER_SECRET_KEY ? new Stripe(STRIPE_DOWNLOADER_SECRET_KEY) : null;
@@ -380,6 +389,31 @@ app.post('/api/downloader/webhook', express.raw({ type: 'application/json' }), a
         await writeUsers(data);
       }
     }
+  }
+
+  res.json({ received: true });
+}));
+
+// Donation webhook — verifies the signature and acknowledges receipt only. There is
+// deliberately no side effect here yet: donations are collected via a static Stripe
+// Payment Link the frontend links to directly, so nothing downstream currently reads
+// donation events. This endpoint exists so Stripe has somewhere valid to deliver them
+// (avoiding the "endpoint failing" emails a registered-but-unhandled URL would cause),
+// and so a future feature (e.g. a public "total raised" counter) has a verified event
+// stream to build on without re-doing the signature-verification wiring.
+app.post('/api/donate/webhook', express.raw({ type: 'application/json' }), asyncHandler(async (req, res) => {
+  if (!stripe || !STRIPE_DONATE_WEBHOOK_SECRET) return res.status(503).send('Webhook not configured.');
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_DONATE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send('Webhook signature verification failed.');
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    console.log(`Donation received: ${session.amount_total} ${session.currency} (session ${session.id})`);
   }
 
   res.json({ received: true });
