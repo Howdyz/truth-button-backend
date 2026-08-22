@@ -31,6 +31,15 @@
 //                               so this webhook has nothing to trigger yet — it only verifies the
 //                               signature and acknowledges receipt. Unset = endpoint returns 503.
 //   FRONTEND_URL              — where Stripe Checkout redirects after payment (default: the live site).
+//   FTC_DATA_GOV_API_KEY      — free key from api.data.gov/signup, used to query the FTC's public Do Not
+//                               Call complaint data for Scam Caller ID. Unset = falls back to "DEMO_KEY",
+//                               which api.data.gov rate-limits far too hard for real traffic (a handful of
+//                               requests per hour) — get your own free key before relying on this in
+//                               production.
+//   TWILIO_ACCOUNT_SID        — optional. Enables the "try a caller name" CNAM lookup in Scam Caller ID
+//   TWILIO_AUTH_TOKEN           (real money, ~$0.01/lookup on your Twilio account — that's why it's a
+//                               separate opt-in button, not run automatically on every search). Unset =
+//                               the CNAM button just says the feature isn't configured.
 
 const express = require('express');
 const cors = require('cors');
@@ -910,6 +919,176 @@ app.delete('/api/qrlinks/:id', requireAuth, asyncHandler(async (req, res) => {
   writeQrLinks(data)
     .then(() => res.json({ ok: true }))
     .catch(() => res.status(500).json({ error: 'Could not delete the link.' }));
+}));
+
+// ---------- Scam Caller ID ----------
+// Three data sources, deliberately kept separate rather than merged into one
+// black-box "identity" result:
+//   1. FTC Do Not Call complaint data (free, official, real) — the actual
+//      useful signal for "is this a scam/robocall," not a name.
+//   2. Twilio CNAM (optional, ~$0.01/lookup on the site's own Twilio account) —
+//      a real caller name when available, opt-in per-search since it costs
+//      real money and CNAM coverage is genuinely spotty for mobile numbers.
+//   3. Community reports — signed-in users tagging numbers themselves, same
+//      shape as Reviews (public to read, signed-in to contribute).
+function readScamReports(number){ return storeGet('tb:scamid:reports:' + number, { reports: [] }); }
+function writeScamReports(number, data){ return storeSet('tb:scamid:reports:' + number, data); }
+
+const SCAM_REPORT_TAGS = new Set(['scam', 'robocall', 'telemarketer', 'legit-business', 'personal', 'unknown']);
+
+// Accepts common US formats ("(555) 123-4567", "555-123-4567", "+15551234567",
+// "15551234567") and normalizes to a bare 10-digit string, or null if it
+// doesn't look like a real US number once the formatting is stripped.
+function normalizeUsPhoneNumber(input){
+  let digits = String(input || '').replace(/\D/g, '');
+  if (digits.length === 11 && digits[0] === '1') digits = digits.slice(1);
+  return /^[2-9]\d{9}$/.test(digits) ? digits : null;
+}
+
+// GET /api/scamid/lookup/:number — public, cached. The FTC API has no way to
+// filter by an exact phone number (only area_code, date range, state, city,
+// is_robocall) — so this queries the target's area code over a bounded recent
+// window (180 days; older complaints are about a number that may well have
+// been reassigned since, same staleness problem as an old phone book) and
+// filters for exact matches itself. Paginated, capped at MAX_PAGES to keep
+// response time and FTC API usage bounded — a handful of very high-volume
+// area codes could in principle have a match beyond that cap, which the
+// response says plainly (`truncated: true`) rather than silently.
+const FTC_API_KEY = process.env.FTC_DATA_GOV_API_KEY || 'DEMO_KEY';
+const SCAMID_MAX_PAGES = 10; // 10 * 50 = 500 most-recent complaints for that area code
+
+app.get('/api/scamid/lookup/:number', perMinute(20), asyncHandler(async (req, res) => {
+  const number = normalizeUsPhoneNumber(req.params.number);
+  if (!number) return res.status(400).json({ error: 'Enter a valid 10-digit US phone number.' });
+
+  const cacheKey = 'tb:scamid:ftc:' + number;
+  const cached = await storeGet(cacheKey, null);
+  if (cached) return res.json({ ...cached, cached: true });
+
+  const areaCode = number.slice(0, 3);
+  const dateTo = new Date().toISOString().slice(0, 10);
+  const dateFrom = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
+
+  const matches = [];
+  let truncated = false;
+  let ftcError = null;
+  try {
+    for (let page = 0; page < SCAMID_MAX_PAGES; page++) {
+      const params = new URLSearchParams({
+        api_key: FTC_API_KEY,
+        area_code: areaCode,
+        created_date_from: `"${dateFrom}"`,
+        created_date_to: `"${dateTo}"`,
+        items_per_page: '50',
+        offset: String(page * 50)
+      });
+      const resp = await fetch(`https://api.ftc.gov/v0/dnc-complaints?${params.toString()}`);
+      if (!resp.ok) { ftcError = `FTC API returned ${resp.status}`; break; }
+      const body = await resp.json();
+      const records = body.data || [];
+      for (const rec of records) {
+        if (rec.attributes && rec.attributes['company-phone-number'] === number) matches.push(rec.attributes);
+      }
+      const total = (body.meta && body.meta['record-total']) || 0;
+      if (records.length < 50 || (page + 1) * 50 >= total) break;
+      if (page === SCAMID_MAX_PAGES - 1) truncated = true;
+    }
+  } catch (err) {
+    ftcError = 'Could not reach the FTC API.';
+  }
+
+  const subjects = {};
+  const states = new Set();
+  let robocallCount = 0;
+  let mostRecent = null;
+  for (const m of matches) {
+    if (m.subject) subjects[m.subject] = (subjects[m.subject] || 0) + 1;
+    if (m['consumer-state']) states.add(m['consumer-state']);
+    if (m['recorded-message-or-robocall'] === 'Y') robocallCount++;
+    const d = m['violation-date'] || m['created-date'];
+    if (d && (!mostRecent || d > mostRecent)) mostRecent = d;
+  }
+
+  const result = {
+    number,
+    reportCount: matches.length,
+    robocallCount,
+    subjects: Object.entries(subjects).sort((a, b) => b[1] - a[1]).map(([subject, count]) => ({ subject, count })),
+    statesReportingFrom: matches.length ? Array.from(states) : [],
+    mostRecentComplaintDate: mostRecent,
+    windowDays: 180,
+    truncated,
+    ftcError
+  };
+
+  // Cache even a zero-match result — still saves a full re-scan of the area
+  // code on the next lookup of the same number within the window.
+  if (!ftcError) storeSetWithTTL(cacheKey, result, 12 * 3600).catch(() => {});
+  res.json(result);
+}));
+
+// GET /api/scamid/cnam/:number — signed-in only (this one costs real money on
+// the site's own Twilio account per lookup, unlike the free FTC route above —
+// requiring sign-in adds accountability/friction against cost-abuse). Cached
+// for 30 days since a number's registered caller name rarely changes.
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+
+app.get('/api/scamid/cnam/:number', requireAuth, perMinute(10), asyncHandler(async (req, res) => {
+  const number = normalizeUsPhoneNumber(req.params.number);
+  if (!number) return res.status(400).json({ error: 'Enter a valid 10-digit US phone number.' });
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+    return res.status(503).json({ error: 'Caller name lookup is not configured on this server.' });
+  }
+
+  const cacheKey = 'tb:scamid:cnam:' + number;
+  const cached = await storeGet(cacheKey, null);
+  if (cached) return res.json({ ...cached, cached: true });
+
+  const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+  const resp = await fetch(`https://lookups.twilio.com/v2/PhoneNumbers/+1${number}?Fields=caller_name`, {
+    headers: { Authorization: `Basic ${auth}` }
+  });
+  if (!resp.ok) return res.status(502).json({ error: 'Caller name lookup failed.' });
+  const body = await resp.json();
+  const callerName = body.caller_name && body.caller_name.caller_name ? body.caller_name.caller_name : null;
+  const callerType = body.caller_name && body.caller_name.caller_type ? body.caller_name.caller_type : null;
+
+  const result = { number, callerName, callerType };
+  storeSetWithTTL(cacheKey, result, 30 * 86400).catch(() => {});
+  res.json(result);
+}));
+
+// GET /api/scamid/reports/:number — public, anyone can read community reports.
+app.get('/api/scamid/reports/:number', asyncHandler(async (req, res) => {
+  const number = normalizeUsPhoneNumber(req.params.number);
+  if (!number) return res.status(400).json({ error: 'Enter a valid 10-digit US phone number.' });
+  const data = await readScamReports(number);
+  const counts = {};
+  for (const r of data.reports) counts[r.tag] = (counts[r.tag] || 0) + 1;
+  res.json({
+    number,
+    reports: data.reports.map(r => ({ tag: r.tag, note: r.note, username: r.username, createdAt: r.createdAt })),
+    counts
+  });
+}));
+
+// POST /api/scamid/reports/:number — signed-in only, one report per user per
+// number (re-submitting replaces their previous report rather than stacking
+// duplicates — same spirit as a review, not a vote-brigading mechanism).
+app.post('/api/scamid/reports/:number', requireAuth, perMinute(10), asyncHandler(async (req, res) => {
+  const number = normalizeUsPhoneNumber(req.params.number);
+  if (!number) return res.status(400).json({ error: 'Enter a valid 10-digit US phone number.' });
+  const tag = String((req.body || {}).tag || '');
+  if (!SCAM_REPORT_TAGS.has(tag)) return res.status(400).json({ error: 'Invalid report tag.' });
+  const note = clip((req.body || {}).note || '', 300);
+
+  const data = await readScamReports(number);
+  data.reports = data.reports.filter(r => r.userId !== req.user.id);
+  data.reports.push({ userId: req.user.id, username: req.user.username, tag, note, createdAt: Date.now() });
+  await writeScamReports(number, data);
+
+  res.status(201).json({ ok: true });
 }));
 
 // ---------- Share pages (Open Graph cards, server-hosted) ----------
